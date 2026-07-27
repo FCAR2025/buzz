@@ -471,7 +471,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 6);
+        assert_eq!(migrations.len(), 7);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -555,6 +555,24 @@ mod tests {
             );
         }
         assert!(!migrations[0].sql.as_str().contains("moderation_reports"));
+
+        // Use-limited invite links stay additive so brownfield databases keep
+        // the immutable checksums for migrations 0001 through 0006.
+        assert_eq!(migrations[6].version, 25);
+        let relay_invites = migrations[6].sql.as_str();
+        assert!(relay_invites.contains("CREATE TABLE relay_invites"));
+        assert!(relay_invites
+            .contains("token_hash   BYTEA       NOT NULL CHECK (length(token_hash) = 32)"));
+        assert!(relay_invites.contains("PRIMARY KEY (community_id, id)"));
+        assert!(relay_invites.contains("UNIQUE (community_id, token_hash)"));
+        assert!(
+            relay_invites.contains("max_uses     INTEGER     CHECK (max_uses BETWEEN 1 AND 10000)")
+        );
+        assert!(relay_invites.contains("CHECK (max_uses IS NULL OR use_count <= max_uses)"));
+        assert!(relay_invites.contains("role = 'member'"));
+        assert!(relay_invites
+            .contains("CREATE INDEX relay_invites_expires_at_idx ON relay_invites (expires_at)"));
+        assert!(!relay_invites.contains("_operator_global_tables"));
     }
 
     #[test]

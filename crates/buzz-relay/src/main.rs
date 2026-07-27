@@ -491,6 +491,21 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(reaper_interval_secs)).await;
 
+                let invite_cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+                match reaper_state
+                    .db
+                    .reap_expired_relay_invites(invite_cutoff)
+                    .await
+                {
+                    Ok(deleted) if deleted > 0 => {
+                        info!(deleted, "reaped expired relay invites");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        error!(%error, "invite reaper tick failed");
+                    }
+                }
+
                 let expired = match reaper_state.db.reap_expired_ephemeral_channels().await {
                     Ok(ids) => ids,
                     Err(e) => {

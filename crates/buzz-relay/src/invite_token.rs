@@ -49,10 +49,10 @@ use buzz_core::tenant::CommunityId;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Default invite lifetime: 72 hours.
-pub const DEFAULT_INVITE_TTL_SECS: u64 = 72 * 60 * 60;
+pub use buzz_core::invite::DEFAULT_INVITE_TTL_SECS;
 
 /// Maximum invite lifetime a mint request may ask for: 30 days.
-pub const MAX_INVITE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+pub use buzz_core::invite::MAX_INVITE_TTL_SECS;
 
 /// Maximum accepted code length (defense against absurd inputs before any
 /// parsing work happens). A real code is ~200 bytes.
@@ -115,16 +115,18 @@ pub fn derive_invite_key(relay_keys: &nostr::Keys) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+#[cfg(test)]
 fn sign_payload(key: &[u8; 32], payload_bytes: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
     mac.update(payload_bytes);
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Mint an invite code for `community`, expiring `ttl_secs` from now.
+/// Mint a legacy v1 invite code for compatibility tests.
 ///
-/// The role is fixed to `"member"` — elevated roles are granted post-join via
-/// the existing kind:9032 change-role command, never via a bearer link.
+/// Production minting uses database-backed v2 codes. Remove this helper with
+/// v1 claim verification after the compatibility drain window.
+#[cfg(test)]
 pub fn mint_invite(key: &[u8; 32], community: CommunityId, ttl_secs: u64) -> (String, u64) {
     let ttl = ttl_secs.clamp(60, MAX_INVITE_TTL_SECS);
     let expires_at = now_unix() + ttl;
