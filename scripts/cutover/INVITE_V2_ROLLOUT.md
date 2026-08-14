@@ -56,7 +56,7 @@ Independently attest the preimage from the controller before the first relay rec
 ssh root@nspawn-buzz 'backup_dir=$(< /etc/buzz/invite-v2-backup-path); cd "$backup_dir" && sha256sum --check SHA256SUMS'
 ```
 
-The backup guard requires `compose.yml`, `.env`, `nginx-relay.conf`, `etc-buzz.tar`, `relay-container-inspect.json`, `database-preimage.dump`, and `SHA256SUMS`. The directory must be root-owned mode `0700`; the pointer and every artifact must be root-owned mode `0600`. Every required artifact must appear exactly once in the manifest. The guard reads the tar, parses the JSON with Python without printing its contents, and streams the full custom-format dump into `pg_restore --list -` inside the matching PostgreSQL container before allowing the rollout to continue. It does not require host `jq` or `pg_restore`.
+The backup guard requires `compose.yml`, `.env`, `nginx-relay.conf`, `etc-buzz.tar`, `relay-container-inspect.json`, `database-preimage.dump`, and `SHA256SUMS`. The directory must be root-owned mode `0700`; the pointer and every artifact must be root-owned mode `0600`. Every required artifact must appear exactly once in the manifest. The guard reads the tar, parses the JSON with Python without printing its contents, and streams the full custom-format dump into `pg_restore --list` inside the matching PostgreSQL container before allowing the rollout to continue. It does not require host `jq` or `pg_restore`.
 
 Stage the old image with migration checking disabled, then capture the pre-migration state:
 

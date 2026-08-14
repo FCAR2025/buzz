@@ -11,7 +11,12 @@ fail() {
 }
 
 tmp_dir=$(mktemp -d)
-trap 'rm -rf "$tmp_dir"' EXIT
+real_pg=''
+cleanup() {
+  [[ -z "$real_pg" ]] || docker rm -f "$real_pg" >/dev/null 2>&1 || true
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT
 export BUZZ_ALLOW_NON_ROOT=1
 export BUZZ_ALLOW_DIRTY_SOURCE=1
 
@@ -78,7 +83,7 @@ chmod 0600 "$tmp_dir/complete.pointer"
 
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
-if [[ "$1" == exec && "$2" == -i && "$*" == *'pg_restore --list -'* ]]; then
+if [[ "$#" == 5 && "$1" == exec && "$2" == -i && "$4" == pg_restore && "$5" == --list ]]; then
   payload=$(tee)
   [[ "$payload" == valid-dump ]]
   exit
@@ -110,6 +115,45 @@ fi
 grep -Fq 'trusted-owner mode 0600' "$tmp_dir/backup-mode.err" ||
   fail 'unsafe backup mode failure was not explicit'
 chmod 0600 "$complete_backup/.env"
+
+real_pg="buzz-invite-archive-test-$$"
+docker run -d --name "$real_pg" \
+  -e POSTGRES_USER=buzz -e POSTGRES_PASSWORD=buzz_dev -e POSTGRES_DB=buzz \
+  postgres:18-alpine >/dev/null
+for _ in $(seq 1 60); do
+  docker exec "$real_pg" pg_isready -U buzz -d buzz >/dev/null 2>&1 && break
+  sleep 1
+done
+docker exec "$real_pg" psql -X -v ON_ERROR_STOP=1 -U buzz -d buzz \
+  -c 'CREATE TABLE archive_probe (id integer PRIMARY KEY)' >/dev/null
+
+real_backup="${backup_prefix}real"
+mkdir -m 0700 "$real_backup"
+printf 'compose\n' >"$real_backup/compose.yml"
+printf 'env\n' >"$real_backup/.env"
+printf 'nginx\n' >"$real_backup/nginx-relay.conf"
+docker inspect "$real_pg" >"$real_backup/relay-container-inspect.json"
+docker exec "$real_pg" pg_dump -U buzz -d buzz -Fc >"$real_backup/database-preimage.dump"
+tar -cf "$real_backup/etc-buzz.tar" -C "$tmp_dir" incomplete.pointer
+chmod 0600 "$real_backup"/* "$real_backup/.env"
+"$ROLLOUT" write-manifest "$real_backup"
+printf '%s\n' "$real_backup" >"$tmp_dir/real.pointer"
+chmod 0600 "$tmp_dir/real.pointer"
+BUZZ_BACKUP_PATH_PREFIX="$backup_prefix" BUZZ_BACKUP_POINTER="$tmp_dir/real.pointer" \
+  BUZZ_POSTGRES_CONTAINER="$real_pg" "$ROLLOUT" assert-backup
+
+printf 'corrupt-real-archive\n' >"$real_backup/database-preimage.dump"
+chmod 0600 "$real_backup/database-preimage.dump"
+"$ROLLOUT" write-manifest "$real_backup"
+if BUZZ_BACKUP_PATH_PREFIX="$backup_prefix" BUZZ_BACKUP_POINTER="$tmp_dir/real.pointer" \
+  BUZZ_POSTGRES_CONTAINER="$real_pg" "$ROLLOUT" assert-backup \
+  2>"$tmp_dir/corrupt-real.err"; then
+  fail 'real PostgreSQL restore preflight accepted a corrupt rehashed archive'
+fi
+grep -Fq 'PostgreSQL dump restore preflight failed' "$tmp_dir/corrupt-real.err" ||
+  fail 'real corrupt archive failure was not explicit'
+docker rm -f "$real_pg" >/dev/null
+real_pg=''
 
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
