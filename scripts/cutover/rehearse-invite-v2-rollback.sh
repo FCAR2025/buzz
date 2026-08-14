@@ -6,10 +6,11 @@ ROLLOUT="$SCRIPT_DIR/invite-v2-rollout.sh"
 OLD_IMAGE=${BUZZ_REHEARSAL_OLD_IMAGE:-ghcr.io/block/buzz:0.2.0@sha256:a0f67203d71d15d237fa7517788799957c30c8acdb81cbcff711e07e951c2710}
 CANDIDATE_RECEIPT=${BUZZ_REHEARSAL_CANDIDATE_RECEIPT:-/root/buzz-invite-v2-final/candidate.receipt}
 CANDIDATE_SOURCE=${BUZZ_REHEARSAL_CANDIDATE_SOURCE:-$SCRIPT_DIR/../..}
+CANDIDATE_ARCHIVE=${BUZZ_REHEARSAL_CANDIDATE_ARCHIVE:-/root/buzz-invite-v2-final/candidate-image.tar}
+CANDIDATE_IMAGE=${BUZZ_REHEARSAL_CANDIDATE_IMAGE:-buzz-relay-invite-v2:75c4c5160}
 
-BUZZ_ALLOW_NON_ROOT=1 "$ROLLOUT" verify-candidate-receipt "$CANDIDATE_RECEIPT" "$CANDIDATE_SOURCE"
-CANDIDATE_IMAGE=$(grep -E '^candidate_image_id=' "$CANDIDATE_RECEIPT")
-CANDIDATE_IMAGE=${CANDIDATE_IMAGE#*=}
+BUZZ_ALLOW_NON_ROOT=1 BUZZ_ALLOW_CLASSIC_IMAGE_STORE=1 BUZZ_CANDIDATE_INSPECT_REF="$CANDIDATE_IMAGE" \
+  "$ROLLOUT" verify-candidate-receipt "$CANDIDATE_RECEIPT" "$CANDIDATE_SOURCE" "$CANDIDATE_ARCHIVE"
 
 run_id="invite-v2-rehearsal-$$"
 network="$run_id"
@@ -147,7 +148,8 @@ fi
 printf '5/6 candidate serves schema 25 with auto-migrate disabled\n'
 relay_run "$CANDIDATE_IMAGE" false
 wait_relay
-BUZZ_ALLOW_NON_ROOT=1 "$ROLLOUT" assert-running-candidate "$CANDIDATE_RECEIPT" "$relay"
+BUZZ_ALLOW_NON_ROOT=1 BUZZ_ALLOW_CLASSIC_IMAGE_STORE=1 \
+  "$ROLLOUT" assert-running-candidate "$CANDIDATE_RECEIPT" "$CANDIDATE_ARCHIVE" "$relay"
 [[ $(docker exec "$postgres" psql -U buzz -d buzz -Atc 'select count(*) from relay_invites') == 0 ]]
 
 printf '6/6 old base rollback serves schema 25 with auto-migrate disabled\n'

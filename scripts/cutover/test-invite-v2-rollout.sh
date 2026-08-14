@@ -178,10 +178,70 @@ candidate_tree=$(git -C "$source_checkout" rev-parse 'HEAD^{tree}')
 candidate_base=0d9be2fde1fc18e57da8f2ca229cc01699867550
 candidate_patch=$(git -C "$source_checkout" diff --binary --full-index --no-ext-diff \
   "$candidate_base" "$candidate_revision" | sha256sum | cut -d' ' -f1)
+candidate_archive="$tmp_dir/candidate-image.tar"
+python3 - "$candidate_archive" "$candidate_revision" >"$tmp_dir/archive.facts" <<'PY'
+import hashlib, io, json, sys, tarfile
+
+archive, revision = sys.argv[1:]
+layers = [b"candidate-layer-one\n", b"candidate-layer-two\n"]
+layer_digests = [hashlib.sha256(layer).hexdigest() for layer in layers]
+config = json.dumps({
+    "architecture": "amd64",
+    "os": "linux",
+    "config": {"Labels": {"org.opencontainers.image.revision": revision}},
+    "rootfs": {"type": "layers", "diff_ids": ["sha256:" + digest for digest in layer_digests]},
+}, separators=(",", ":")).encode()
+config_digest = hashlib.sha256(config).hexdigest()
+manifest = json.dumps({
+    "schemaVersion": 2,
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": "sha256:" + config_digest, "size": len(config)},
+    "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:" + digest, "size": len(layer)} for digest, layer in zip(layer_digests, layers)],
+}, separators=(",", ":")).encode()
+manifest_digest = hashlib.sha256(manifest).hexdigest()
+index = json.dumps({
+    "schemaVersion": 2,
+    "mediaType": "application/vnd.oci.image.index.v1+json",
+    "manifests": [{"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "sha256:" + manifest_digest, "size": len(manifest)}],
+}, separators=(",", ":")).encode()
+entries = {
+    "index.json": index,
+    "oci-layout": b'{"imageLayoutVersion":"1.0.0"}',
+    "blobs/sha256/" + manifest_digest: manifest,
+    "blobs/sha256/" + config_digest: config,
+}
+for digest, layer in zip(layer_digests, layers):
+    entries["blobs/sha256/" + digest] = layer
+with tarfile.open(archive, "w") as tf:
+    for name, payload in entries.items():
+        info = tarfile.TarInfo(name)
+        info.size = len(payload)
+        info.mode = 0o600
+        tf.addfile(info, io.BytesIO(payload))
+archive_digest = hashlib.sha256(open(archive, "rb").read()).hexdigest()
+print("candidate_archive_sha256=" + archive_digest)
+print("candidate_manifest_digest=sha256:" + manifest_digest)
+print("candidate_manifest_size=" + str(len(manifest)))
+print("candidate_config_digest=sha256:" + config_digest)
+print("candidate_config_size=" + str(len(config)))
+print("candidate_layers=" + ",".join("sha256:" + digest + ":" + str(len(layer)) for digest, layer in zip(layer_digests, layers)))
+PY
+candidate_archive_sha256='' candidate_manifest_digest='' candidate_manifest_size=''
+candidate_config_digest='' candidate_config_size='' candidate_layers=''
+# shellcheck disable=SC1091
+source "$tmp_dir/archive.facts"
+candidate_image="buzz-relay-invite-v2@$candidate_manifest_digest"
 candidate_receipt="$tmp_dir/candidate.receipt"
 cat >"$candidate_receipt" <<EOF
 candidate_image_ref=$candidate_image
-candidate_image_id=$candidate_id
+candidate_archive_sha256=$candidate_archive_sha256
+candidate_manifest_digest=$candidate_manifest_digest
+candidate_manifest_size=$candidate_manifest_size
+candidate_config_digest=$candidate_config_digest
+candidate_config_size=$candidate_config_size
+candidate_layers=$candidate_layers
+candidate_os=linux
+candidate_arch=amd64
 candidate_oci_revision=$candidate_revision
 candidate_commit=$candidate_revision
 candidate_tree=$candidate_tree
@@ -193,8 +253,12 @@ cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$1" == image && "$2" == inspect && "$3" == --format=* ]]; then
   case "$3" in
+    *'.Descriptor.digest'*) printf '%s\n' "${FAKE_DESCRIPTOR_DIGEST:-}" ;;
     *'.Id'*) printf '%s\n' "${FAKE_IMAGE_ID:?}" ;;
+    *'.RepoDigests'*) printf '%s\n' "${FAKE_REPO_DIGESTS:-}" ;;
     *'org.opencontainers.image.revision'*) printf '%s\n' "${FAKE_IMAGE_REVISION:?}" ;;
+    *'.Os'*) printf '%s\n' "${FAKE_IMAGE_OS:-linux}" ;;
+    *'.Architecture'*) printf '%s\n' "${FAKE_IMAGE_ARCH:-amd64}" ;;
     *) exit 64 ;;
   esac
   exit 0
@@ -203,17 +267,94 @@ exit 64
 EOF
 chmod +x "$fake_bin/docker"
 
-PATH="$fake_bin:$PATH" FAKE_IMAGE_ID="$candidate_id" FAKE_IMAGE_REVISION="$candidate_revision" \
-  "$ROLLOUT" verify-candidate-receipt "$candidate_receipt" "$source_checkout"
-if PATH="$fake_bin:$PATH" FAKE_IMAGE_ID='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
-  FAKE_IMAGE_REVISION="$candidate_revision" "$ROLLOUT" verify-candidate-receipt "$candidate_receipt" "$source_checkout" \
-  2>"$tmp_dir/image-id.err"; then
-  fail 'candidate receipt accepted an image ID mismatch'
+PATH="$fake_bin:$PATH" BUZZ_ALLOW_CLASSIC_IMAGE_STORE=1 FAKE_IMAGE_ID="$candidate_config_digest" FAKE_IMAGE_REVISION="$candidate_revision" \
+  "$ROLLOUT" verify-candidate-receipt "$candidate_receipt" "$source_checkout" "$candidate_archive"
+PATH="$fake_bin:$PATH" FAKE_IMAGE_ID="$candidate_manifest_digest" FAKE_DESCRIPTOR_DIGEST="$candidate_manifest_digest" \
+  FAKE_REPO_DIGESTS="$candidate_image" FAKE_IMAGE_REVISION="$candidate_revision" \
+  "$ROLLOUT" verify-candidate-receipt "$candidate_receipt" "$source_checkout" "$candidate_archive"
+
+tamper_archive_member() {
+  local source=$1 output=$2 member=$3
+  python3 - "$source" "$output" "$member" <<'PY'
+import io, sys, tarfile
+source, output, target = sys.argv[1:]
+with tarfile.open(source, "r:*") as old, tarfile.open(output, "w") as new:
+    for member in old.getmembers():
+        if not member.isfile():
+            continue
+        payload = old.extractfile(member).read()
+        if member.name == target:
+            payload += b"tampered"
+        copy = tarfile.TarInfo(member.name)
+        copy.size = len(payload)
+        copy.mode = member.mode
+        new.addfile(copy, io.BytesIO(payload))
+PY
+}
+
+tampered_archive="$tmp_dir/tampered-archive.tar"
+cp "$candidate_archive" "$tampered_archive"
+printf 'trailing-tamper\n' >>"$tampered_archive"
+if PATH="$fake_bin:$PATH" FAKE_IMAGE_ID="$candidate_config_digest" FAKE_IMAGE_REVISION="$candidate_revision" \
+  "$ROLLOUT" verify-candidate-receipt "$candidate_receipt" "$source_checkout" "$tampered_archive" 2>"$tmp_dir/archive-tamper.err"; then
+  fail 'candidate receipt accepted a tampered archive'
 fi
-grep -Fq 'candidate image ID mismatch' "$tmp_dir/image-id.err" || fail 'image ID mismatch was not explicit'
-if PATH="$fake_bin:$PATH" FAKE_IMAGE_ID="$candidate_id" \
+grep -Fq 'candidate archive SHA-256 mismatch' "$tmp_dir/archive-tamper.err" || fail 'archive tamper failure was not explicit'
+
+for boundary in manifest config layer; do
+  case "$boundary" in
+    manifest) member="blobs/sha256/${candidate_manifest_digest#sha256:}" ;;
+    config) member="blobs/sha256/${candidate_config_digest#sha256:}" ;;
+    layer) first_layer=${candidate_layers%%,*}; member="blobs/sha256/$(printf '%s' "$first_layer" | cut -d: -f2)" ;;
+  esac
+  bad_archive="$tmp_dir/tampered-$boundary.tar"
+  bad_receipt="$tmp_dir/tampered-$boundary.receipt"
+  tamper_archive_member "$candidate_archive" "$bad_archive" "$member"
+  cp "$candidate_receipt" "$bad_receipt"
+  perl -0pi -e "s/^candidate_archive_sha256=.*/candidate_archive_sha256=$(sha256sum "$bad_archive" | cut -d' ' -f1)/m" "$bad_receipt"
+  if PATH="$fake_bin:$PATH" FAKE_IMAGE_ID="$candidate_config_digest" FAKE_IMAGE_REVISION="$candidate_revision" \
+    "$ROLLOUT" verify-candidate-receipt "$bad_receipt" "$source_checkout" "$bad_archive" 2>"$tmp_dir/$boundary-tamper.err"; then
+    fail "candidate receipt accepted a tampered $boundary blob"
+  fi
+  grep -Eq "$boundary blob digest or size mismatch|config descriptor mismatch" "$tmp_dir/$boundary-tamper.err" ||
+    fail "$boundary tamper failure was not explicit"
+done
+
+for boundary in layer-order platform revision; do
+  bad_receipt="$tmp_dir/bad-$boundary.receipt"
+  cp "$candidate_receipt" "$bad_receipt"
+  case "$boundary" in
+    layer-order)
+      first_layer=${candidate_layers%%,*}; second_layer=${candidate_layers#*,}
+      perl -0pi -e "s/^candidate_layers=.*/candidate_layers=$second_layer,$first_layer/m" "$bad_receipt"
+      expected_error='ordered layer descriptors mismatch'
+      ;;
+    platform)
+      perl -0pi -e 's/^candidate_arch=.*/candidate_arch=arm64/m' "$bad_receipt"
+      expected_error='platform must be linux/amd64'
+      ;;
+    revision)
+      perl -0pi -e "s/^candidate_oci_revision=.*/candidate_oci_revision=$candidate_base/m" "$bad_receipt"
+      expected_error='revision mismatch'
+      ;;
+  esac
+  if PATH="$fake_bin:$PATH" FAKE_IMAGE_ID="$candidate_config_digest" FAKE_IMAGE_REVISION="$candidate_revision" \
+    "$ROLLOUT" verify-candidate-receipt "$bad_receipt" "$source_checkout" "$candidate_archive" 2>"$tmp_dir/$boundary.err"; then
+    fail "candidate receipt accepted mismatched $boundary"
+  fi
+  grep -Fq "$expected_error" "$tmp_dir/$boundary.err" || fail "$boundary mismatch was not explicit"
+done
+
+if PATH="$fake_bin:$PATH" FAKE_IMAGE_ID="$candidate_manifest_digest" \
+  FAKE_DESCRIPTOR_DIGEST='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  FAKE_REPO_DIGESTS="$candidate_image" FAKE_IMAGE_REVISION="$candidate_revision" \
+  "$ROLLOUT" verify-candidate-receipt "$candidate_receipt" "$source_checkout" "$candidate_archive" 2>"$tmp_dir/image-id.err"; then
+  fail 'candidate receipt accepted a manifest descriptor mismatch'
+fi
+grep -Fq 'candidate manifest digest mismatch' "$tmp_dir/image-id.err" || fail 'manifest mismatch was not explicit'
+if PATH="$fake_bin:$PATH" BUZZ_ALLOW_CLASSIC_IMAGE_STORE=1 FAKE_IMAGE_ID="$candidate_config_digest" \
   FAKE_IMAGE_REVISION='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
-  "$ROLLOUT" verify-candidate-receipt "$candidate_receipt" "$source_checkout" 2>"$tmp_dir/revision.err"; then
+  "$ROLLOUT" verify-candidate-receipt "$candidate_receipt" "$source_checkout" "$candidate_archive" 2>"$tmp_dir/revision.err"; then
   fail 'candidate receipt accepted an OCI revision mismatch'
 fi
 grep -Fq 'candidate OCI revision mismatch' "$tmp_dir/revision.err" || fail 'OCI revision mismatch was not explicit'
@@ -240,8 +381,8 @@ for field in candidate_commit candidate_tree base_commit patch_sha256; do
       bad_revision=$candidate_revision
       ;;
   esac
-  if PATH="$fake_bin:$PATH" FAKE_IMAGE_ID="$candidate_id" FAKE_IMAGE_REVISION="$bad_revision" \
-    "$ROLLOUT" verify-candidate-receipt "$bad_receipt" "$source_checkout" 2>"$tmp_dir/$field.err"; then
+  if PATH="$fake_bin:$PATH" FAKE_IMAGE_ID="$candidate_config_digest" FAKE_IMAGE_REVISION="$bad_revision" \
+    "$ROLLOUT" verify-candidate-receipt "$bad_receipt" "$source_checkout" "$candidate_archive" 2>"$tmp_dir/$field.err"; then
     fail "candidate receipt accepted mismatched $field"
   fi
   grep -Fq 'candidate source lineage mismatch' "$tmp_dir/$field.err" ||
@@ -255,24 +396,44 @@ if [[ "$1" == inspect && "$2" == --format=* ]]; then
   exit 0
 fi
 if [[ "$1" == image && "$2" == inspect && "$3" == --format=* ]]; then
-  printf '%s\n' "${FAKE_IMAGE_REVISION:?}"
+  case "$3" in
+    *'.Descriptor.digest'*) printf '%s\n' "${FAKE_DESCRIPTOR_DIGEST:?}" ;;
+    *'.RepoDigests'*) printf '%s\n' "${FAKE_REPO_DIGESTS:?}" ;;
+    *'org.opencontainers.image.revision'*) printf '%s\n' "${FAKE_IMAGE_REVISION:?}" ;;
+    *'.Os'*) printf 'linux\n' ;;
+    *'.Architecture'*) printf 'amd64\n' ;;
+    *) exit 64 ;;
+  esac
   exit 0
 fi
 exit 64
 EOF
 chmod +x "$fake_bin/docker"
-PATH="$fake_bin:$PATH" FAKE_RUNNING_IMAGE_ID="$candidate_id" FAKE_IMAGE_REVISION="$candidate_revision" \
-  "$ROLLOUT" assert-running-candidate "$candidate_receipt" relay-under-test
+PATH="$fake_bin:$PATH" FAKE_RUNNING_IMAGE_ID="$candidate_manifest_digest" \
+  FAKE_DESCRIPTOR_DIGEST="$candidate_manifest_digest" FAKE_REPO_DIGESTS="$candidate_image" \
+  FAKE_IMAGE_REVISION="$candidate_revision" \
+  "$ROLLOUT" assert-running-candidate "$candidate_receipt" "$candidate_archive" relay-under-test
+if PATH="$fake_bin:$PATH" FAKE_RUNNING_IMAGE_ID="$candidate_manifest_digest" \
+  FAKE_DESCRIPTOR_DIGEST="$candidate_manifest_digest" FAKE_REPO_DIGESTS="$candidate_image" \
+  FAKE_IMAGE_REVISION="$candidate_revision" \
+  "$ROLLOUT" assert-running-candidate "$candidate_receipt" "$tampered_archive" relay-under-test \
+  2>"$tmp_dir/running-archive.err"; then
+  fail 'running candidate verification ignored a tampered archive'
+fi
+grep -Fq 'candidate archive SHA-256 mismatch' "$tmp_dir/running-archive.err" ||
+  fail 'running archive tamper failure was not explicit'
 if PATH="$fake_bin:$PATH" \
   FAKE_RUNNING_IMAGE_ID='sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+  FAKE_DESCRIPTOR_DIGEST="$candidate_manifest_digest" FAKE_REPO_DIGESTS="$candidate_image" \
   FAKE_IMAGE_REVISION="$candidate_revision" \
-  "$ROLLOUT" assert-running-candidate "$candidate_receipt" relay-under-test 2>"$tmp_dir/running-id.err"; then
+  "$ROLLOUT" assert-running-candidate "$candidate_receipt" "$candidate_archive" relay-under-test 2>"$tmp_dir/running-id.err"; then
   fail 'running candidate accepted a container image mismatch'
 fi
-grep -Fq 'running candidate image ID mismatch' "$tmp_dir/running-id.err" || fail 'running image mismatch was not explicit'
-if PATH="$fake_bin:$PATH" FAKE_RUNNING_IMAGE_ID="$candidate_id" \
+grep -Fq 'running candidate manifest mismatch' "$tmp_dir/running-id.err" || fail 'running image mismatch was not explicit'
+if PATH="$fake_bin:$PATH" FAKE_RUNNING_IMAGE_ID="$candidate_manifest_digest" \
+  FAKE_DESCRIPTOR_DIGEST="$candidate_manifest_digest" FAKE_REPO_DIGESTS="$candidate_image" \
   FAKE_IMAGE_REVISION='dddddddddddddddddddddddddddddddddddddddd' \
-  "$ROLLOUT" assert-running-candidate "$candidate_receipt" relay-under-test 2>"$tmp_dir/running-revision.err"; then
+  "$ROLLOUT" assert-running-candidate "$candidate_receipt" "$candidate_archive" relay-under-test 2>"$tmp_dir/running-revision.err"; then
   fail 'running candidate accepted a revision mismatch'
 fi
 grep -Fq 'running candidate OCI revision mismatch' "$tmp_dir/running-revision.err" || fail 'running revision mismatch was not explicit'
