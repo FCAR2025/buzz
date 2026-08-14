@@ -10,7 +10,7 @@ The live-base image embeds migrations 1–6. Once database migration 25 exists, 
 
 The rollout script enforces this order:
 
-1. Create and verify a root-only preimage backup.
+1. Create and verify a root-only preimage backup, including exact required artifacts, ownership/modes, complete hashes, readable configuration/container archives, and a PostgreSQL restore-list preflight.
 2. Recreate only the old relay with an immutable old-image digest and auto-migration disabled.
 3. Verify readiness and capture pre-migration invariants.
 4. Apply the exact migration bytes and SQLx SHA-384 record in one PostgreSQL transaction.
@@ -24,27 +24,30 @@ Do not mint or claim an invite during this rollout. The existing stateless v1 li
 - Live base: `0d9be2fde1fc18e57da8f2ca229cc01699867550`
 - Old image: `ghcr.io/block/buzz:0.2.0@sha256:a0f67203d71d15d237fa7517788799957c30c8acdb81cbcff711e07e951c2710`
 - Candidate commit, tree, image ID, OCI revision, base, and patch SHA-256: exact values in the rereviewed `candidate.receipt`
-- Migration SHA-384: `d4fdfc8bc8c9d75f7b812f40d533af80de1053fdd0d95c99b6ff6376e7d7090a8b514ef4e0e9d31aba258e6e7833b1c5`
+- Migration SHA-384: `5ed27780d08863488ec5cddd2661f3619c490cf740f6dd13f242da113efe7e1212b2f2d3a9b548c472f3382ad9f7a155`
 
 The patch SHA-256 is reproducible from an explicit byte stream:
 
 ```bash
-git diff --binary --full-index --no-ext-diff "$(grep '^base_commit=' candidate.receipt | cut -d= -f2-)" "$(grep '^candidate_commit=' candidate.receipt | cut -d= -f2-)" | sha256sum
+git -C source diff --binary --full-index --no-ext-diff "$(grep '^base_commit=' candidate.receipt | cut -d= -f2-)" "$(grep '^candidate_commit=' candidate.receipt | cut -d= -f2-)" | sha256sum
 ```
 
 ## Deployment commands
 
 Run only after independent rereview approves the frozen commit and image.
 
-Place this script, the repository migration, and the independently reviewed receipt at the same relative paths under a root-owned deployment bundle on `nspawn-buzz`, then make the script executable. Load the candidate image before proceeding. The receipt verifier rejects an image whose local ID or `org.opencontainers.image.revision` label differs from the reviewed values.
+Place the complete, clean Git source checkout at `/root/buzz-invite-v2-final/source` and the independently reviewed receipt at `/root/buzz-invite-v2-final/candidate.receipt` on `nspawn-buzz`. Keeping the receipt outside `source` preserves the clean-checkout trust gate. The checkout must have the receipt's candidate commit checked out, contain both the candidate and base Git objects, and include the rollout script and migration at their repository paths. Load the candidate image before proceeding. The receipt verifier recomputes the candidate tree and exact base-to-candidate patch hash from that trusted checkout, then rejects an image whose local ID or `org.opencontainers.image.revision` label differs from the reviewed values.
 
 ```bash
-cd /root/buzz-invite-v2-final
-scripts/cutover/invite-v2-rollout.sh verify-candidate-receipt candidate.receipt
+bundle=/root/buzz-invite-v2-final
+source_checkout="$bundle/source"
+rollout="$source_checkout/scripts/cutover/invite-v2-rollout.sh"
+cd "$bundle"
+"$rollout" verify-candidate-receipt candidate.receipt "$source_checkout"
 
 backup_dir=/root/buzz-rollbacks/invite-v2-$(date -u +%Y%m%dT%H%M%SZ)
-scripts/cutover/invite-v2-rollout.sh backup "$backup_dir"
-scripts/cutover/invite-v2-rollout.sh assert-backup
+"$rollout" backup "$backup_dir"
+"$rollout" assert-backup
 ```
 
 Independently attest the preimage from the controller before the first relay recreation:
@@ -53,24 +56,26 @@ Independently attest the preimage from the controller before the first relay rec
 ssh root@nspawn-buzz 'backup_dir=$(< /etc/buzz/invite-v2-backup-path); cd "$backup_dir" && sha256sum --check SHA256SUMS'
 ```
 
+The backup guard requires `compose.yml`, `.env`, `nginx-relay.conf`, `etc-buzz.tar`, `relay-container-inspect.json`, `database-preimage.dump`, and `SHA256SUMS`. The directory must be root-owned mode `0700`; the pointer and every artifact must be root-owned mode `0600`. Every required artifact must appear exactly once in the manifest. The guard also reads the tar and JSON and runs `pg_restore --list` against the full custom-format dump before allowing the rollout to continue.
+
 Stage the old image with migration checking disabled, then capture the pre-migration state:
 
 ```bash
-scripts/cutover/invite-v2-rollout.sh stage-old-guard
-scripts/cutover/invite-v2-rollout.sh assert-auto-migrate-off buzz-prod-relay-1
-scripts/cutover/invite-v2-rollout.sh capture-invariants "$backup_dir/before.invariants"
+"$rollout" stage-old-guard
+"$rollout" assert-auto-migrate-off buzz-prod-relay-1
+"$rollout" capture-invariants "$backup_dir/before.invariants"
 ```
 
 Apply migration 25 out of band and deploy the candidate:
 
 ```bash
-scripts/cutover/invite-v2-rollout.sh apply-migration
-scripts/cutover/invite-v2-rollout.sh verify-migration
-scripts/cutover/invite-v2-rollout.sh deploy-candidate candidate.receipt
-scripts/cutover/invite-v2-rollout.sh assert-running-candidate candidate.receipt buzz-prod-relay-1
-scripts/cutover/invite-v2-rollout.sh assert-auto-migrate-off buzz-prod-relay-1
-scripts/cutover/invite-v2-rollout.sh capture-invariants "$backup_dir/after.invariants"
-scripts/cutover/invite-v2-rollout.sh compare-invariants "$backup_dir/before.invariants" "$backup_dir/after.invariants"
+"$rollout" apply-migration
+"$rollout" verify-migration
+"$rollout" deploy-candidate candidate.receipt "$source_checkout"
+"$rollout" assert-running-candidate candidate.receipt buzz-prod-relay-1
+"$rollout" assert-auto-migrate-off buzz-prod-relay-1
+"$rollout" capture-invariants "$backup_dir/after.invariants"
+"$rollout" compare-invariants "$backup_dir/before.invariants" "$backup_dir/after.invariants"
 ```
 
 The comparison permits only three expected changes: migration versions `1–6` become `1–6,25`, `relay_invites` becomes an empty table, and the relay image changes. The invariant comparison ignores `relay_image` only because `verify-candidate-receipt` and `assert-running-candidate` enforce the exact image ID and OCI revision separately. It rejects changes to semantic memberships, message events, community/channel counts, configuration hashes, or non-relay container identities/start times. Relay startup may publish NIP-43 membership-list system events and update membership timestamps; those are excluded from the semantic membership/message invariant because they are existing startup behavior, not member or message drift.
@@ -93,9 +98,11 @@ The final `grep` is expected to return no lines. Record that outcome explicitly;
 Rollback never drops `relay_invites` and never re-enables SQLx migration checking:
 
 ```bash
-cd /root/buzz-invite-v2-final
-scripts/cutover/invite-v2-rollout.sh rollback
-scripts/cutover/invite-v2-rollout.sh assert-auto-migrate-off buzz-prod-relay-1
+bundle=/root/buzz-invite-v2-final
+rollout="$bundle/source/scripts/cutover/invite-v2-rollout.sh"
+cd "$bundle"
+"$rollout" rollback
+"$rollout" assert-auto-migrate-off buzz-prod-relay-1
 curl --fail --silent http://127.0.0.1:3000/health
 curl --fail --silent http://127.0.0.1:8080/_readiness
 ```
@@ -110,7 +117,8 @@ The rehearsal uses the pinned old image, PostgreSQL 18, Redis 7, MinIO, producti
 
 ```bash
 BUZZ_REHEARSAL_CANDIDATE_RECEIPT=/root/buzz-invite-v2-final/candidate.receipt \
-  scripts/cutover/rehearse-invite-v2-rollback.sh
+BUZZ_REHEARSAL_CANDIDATE_SOURCE=/root/buzz-invite-v2-final/source \
+  /root/buzz-invite-v2-final/source/scripts/cutover/rehearse-invite-v2-rollback.sh
 ```
 
 It proves the base image creates migrations 1–6, the guard takes effect before migration 25, the exact migration is recorded, the unguarded old binary fails with SQLx `VersionMissing`, the guarded candidate becomes ready, and the guarded old binary becomes ready again without semantic membership/message drift or restarting supporting services.

@@ -12,6 +12,8 @@ fail() {
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
+export BUZZ_ALLOW_NON_ROOT=1
+export BUZZ_ALLOW_DIRTY_SOURCE=1
 
 if BUZZ_ALLOW_NON_ROOT=1 BUZZ_BACKUP_POINTER="$tmp_dir/missing-backup-pointer" \
   "$ROLLOUT" assert-backup 2>"$tmp_dir/backup.err"; then
@@ -44,6 +46,56 @@ actual_checksum=$("$ROLLOUT" migration-checksum "$MIGRATION")
 fake_bin="$tmp_dir/bin"
 mkdir -p "$fake_bin"
 
+backup_prefix="$tmp_dir/invite-v2-"
+incomplete_backup="${backup_prefix}incomplete"
+mkdir -m 0700 "$incomplete_backup"
+printf 'compose\n' >"$incomplete_backup/compose.yml"
+printf 'dump\n' >"$incomplete_backup/database-preimage.dump"
+chmod 0600 "$incomplete_backup/compose.yml" "$incomplete_backup/database-preimage.dump"
+"$ROLLOUT" write-manifest "$incomplete_backup"
+printf '%s\n' "$incomplete_backup" >"$tmp_dir/incomplete.pointer"
+chmod 0600 "$tmp_dir/incomplete.pointer"
+if BUZZ_ALLOW_NON_ROOT=1 BUZZ_BACKUP_PATH_PREFIX="$backup_prefix" \
+  BUZZ_BACKUP_POINTER="$tmp_dir/incomplete.pointer" "$ROLLOUT" assert-backup \
+  2>"$tmp_dir/incomplete.err"; then
+  fail 'backup guard accepted an incomplete but self-consistent manifest'
+fi
+grep -Fq 'required backup artifact missing' "$tmp_dir/incomplete.err" ||
+  fail 'incomplete backup failure did not identify the missing required artifact'
+
+complete_backup="${backup_prefix}complete"
+mkdir -m 0700 "$complete_backup"
+printf 'compose\n' >"$complete_backup/compose.yml"
+printf 'env\n' >"$complete_backup/.env"
+printf 'nginx\n' >"$complete_backup/nginx-relay.conf"
+printf '[{}]\n' >"$complete_backup/relay-container-inspect.json"
+printf 'dump\n' >"$complete_backup/database-preimage.dump"
+tar -cf "$complete_backup/etc-buzz.tar" -C "$tmp_dir" incomplete.pointer
+chmod 0600 "$complete_backup"/* "$complete_backup/.env"
+"$ROLLOUT" write-manifest "$complete_backup"
+printf '%s\n' "$complete_backup" >"$tmp_dir/complete.pointer"
+chmod 0600 "$tmp_dir/complete.pointer"
+
+cat >"$fake_bin/pg_restore" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == --list && -f "$2" ]]; then
+  exit 0
+fi
+exit 64
+EOF
+chmod +x "$fake_bin/pg_restore"
+PATH="$fake_bin:$PATH" BUZZ_ALLOW_NON_ROOT=1 BUZZ_BACKUP_PATH_PREFIX="$backup_prefix" \
+  BUZZ_BACKUP_POINTER="$tmp_dir/complete.pointer" "$ROLLOUT" assert-backup
+chmod 0644 "$complete_backup/.env"
+if PATH="$fake_bin:$PATH" BUZZ_ALLOW_NON_ROOT=1 BUZZ_BACKUP_PATH_PREFIX="$backup_prefix" \
+  BUZZ_BACKUP_POINTER="$tmp_dir/complete.pointer" "$ROLLOUT" assert-backup \
+  2>"$tmp_dir/backup-mode.err"; then
+  fail 'backup guard accepted an artifact with an unsafe mode'
+fi
+grep -Fq 'trusted-owner mode 0600' "$tmp_dir/backup-mode.err" ||
+  fail 'unsafe backup mode failure was not explicit'
+chmod 0600 "$complete_backup/.env"
+
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$1" == inspect && "$2" == --format=* ]]; then
@@ -61,16 +113,21 @@ grep -Fq 'BUZZ_AUTO_MIGRATE must be false' "$tmp_dir/guard.err" || fail 'guard f
 
 PATH="$fake_bin:$PATH" FAKE_AUTO_MIGRATE=false "$ROLLOUT" assert-auto-migrate-off relay-under-test
 
-candidate_revision='2222222222222222222222222222222222222222'
+source_checkout="$SCRIPT_DIR/../.."
+candidate_revision=$(git -C "$source_checkout" rev-parse HEAD)
+candidate_tree=$(git -C "$source_checkout" rev-parse 'HEAD^{tree}')
+candidate_base=0d9be2fde1fc18e57da8f2ca229cc01699867550
+candidate_patch=$(git -C "$source_checkout" diff --binary --full-index --no-ext-diff \
+  "$candidate_base" "$candidate_revision" | sha256sum | cut -d' ' -f1)
 candidate_receipt="$tmp_dir/candidate.receipt"
 cat >"$candidate_receipt" <<EOF
 candidate_image_ref=$candidate_image
 candidate_image_id=$candidate_id
 candidate_oci_revision=$candidate_revision
 candidate_commit=$candidate_revision
-candidate_tree=3333333333333333333333333333333333333333
-base_commit=4444444444444444444444444444444444444444
-patch_sha256=5555555555555555555555555555555555555555555555555555555555555555
+candidate_tree=$candidate_tree
+base_commit=$candidate_base
+patch_sha256=$candidate_patch
 EOF
 
 cat >"$fake_bin/docker" <<'EOF'
@@ -88,19 +145,49 @@ EOF
 chmod +x "$fake_bin/docker"
 
 PATH="$fake_bin:$PATH" FAKE_IMAGE_ID="$candidate_id" FAKE_IMAGE_REVISION="$candidate_revision" \
-  "$ROLLOUT" verify-candidate-receipt "$candidate_receipt"
+  "$ROLLOUT" verify-candidate-receipt "$candidate_receipt" "$source_checkout"
 if PATH="$fake_bin:$PATH" FAKE_IMAGE_ID='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
-  FAKE_IMAGE_REVISION="$candidate_revision" "$ROLLOUT" verify-candidate-receipt "$candidate_receipt" \
+  FAKE_IMAGE_REVISION="$candidate_revision" "$ROLLOUT" verify-candidate-receipt "$candidate_receipt" "$source_checkout" \
   2>"$tmp_dir/image-id.err"; then
   fail 'candidate receipt accepted an image ID mismatch'
 fi
 grep -Fq 'candidate image ID mismatch' "$tmp_dir/image-id.err" || fail 'image ID mismatch was not explicit'
 if PATH="$fake_bin:$PATH" FAKE_IMAGE_ID="$candidate_id" \
   FAKE_IMAGE_REVISION='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
-  "$ROLLOUT" verify-candidate-receipt "$candidate_receipt" 2>"$tmp_dir/revision.err"; then
+  "$ROLLOUT" verify-candidate-receipt "$candidate_receipt" "$source_checkout" 2>"$tmp_dir/revision.err"; then
   fail 'candidate receipt accepted an OCI revision mismatch'
 fi
 grep -Fq 'candidate OCI revision mismatch' "$tmp_dir/revision.err" || fail 'OCI revision mismatch was not explicit'
+
+for field in candidate_commit candidate_tree base_commit patch_sha256; do
+  bad_receipt="$tmp_dir/bad-$field.receipt"
+  cp "$candidate_receipt" "$bad_receipt"
+  case "$field" in
+    candidate_commit)
+      perl -0pi -e 's/^candidate_commit=.*/candidate_commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/m' "$bad_receipt"
+      perl -0pi -e 's/^candidate_oci_revision=.*/candidate_oci_revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/m' "$bad_receipt"
+      bad_revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      ;;
+    candidate_tree)
+      perl -0pi -e 's/^candidate_tree=.*/candidate_tree=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/m' "$bad_receipt"
+      bad_revision=$candidate_revision
+      ;;
+    base_commit)
+      perl -0pi -e 's/^base_commit=.*/base_commit=cccccccccccccccccccccccccccccccccccccccc/m' "$bad_receipt"
+      bad_revision=$candidate_revision
+      ;;
+    patch_sha256)
+      perl -0pi -e 's/^patch_sha256=.*/patch_sha256=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/m' "$bad_receipt"
+      bad_revision=$candidate_revision
+      ;;
+  esac
+  if PATH="$fake_bin:$PATH" FAKE_IMAGE_ID="$candidate_id" FAKE_IMAGE_REVISION="$bad_revision" \
+    "$ROLLOUT" verify-candidate-receipt "$bad_receipt" "$source_checkout" 2>"$tmp_dir/$field.err"; then
+    fail "candidate receipt accepted mismatched $field"
+  fi
+  grep -Fq 'candidate source lineage mismatch' "$tmp_dir/$field.err" ||
+    fail "source lineage mismatch for $field was not explicit"
+done
 
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash

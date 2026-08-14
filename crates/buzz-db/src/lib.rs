@@ -2346,16 +2346,8 @@ impl Db {
         community: CommunityId,
         token_hash: &[u8; 32],
         claimer_pubkey: &str,
-        policy_version: Option<&str>,
     ) -> Result<relay_invite::ClaimOutcome> {
-        relay_invite::claim_relay_invite(
-            &self.pool,
-            community,
-            token_hash,
-            claimer_pubkey,
-            policy_version,
-        )
-        .await
+        relay_invite::claim_relay_invite(&self.pool, community, token_hash, claimer_pubkey).await
     }
 
     /// Insert a tenant-scoped NIP-56 report row, idempotent by report event id.

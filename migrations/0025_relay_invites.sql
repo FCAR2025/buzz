@@ -8,8 +8,8 @@
 -- Every lookup binds both (community_id, token_hash) so a code presented on
 -- the wrong tenant host returns Invalid — there is no cross-tenant lookup by
 -- hash alone. `FOR UPDATE` during claim serializes concurrent claims for one
--- invite across relay processes; membership insertion, join-policy evidence,
--- and use_count increment share a single commit so exactly one claimant can
+-- invite across relay processes; membership insertion and use_count increment
+-- share a single commit so exactly one claimant can
 -- win the final slot.
 --
 -- max_uses is optional: NULL means unlimited (preserving current behavior).

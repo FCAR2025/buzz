@@ -47,6 +47,7 @@ pub(crate) const CLAIM_RATE_CACHE_CAPACITY: u64 = 10_000;
 
 /// Body for `POST /api/invites`.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MintInviteRequest {
     /// Requested lifetime in seconds. Must be between
     /// [`MIN_INVITE_TTL_SECS`] and
@@ -243,7 +244,7 @@ pub async fn claim_invite(
         let token_hash = hash_v2_code(&request.code);
         let outcome = state
             .db
-            .claim_relay_invite(tenant.community(), &token_hash, &claimer_hex, None)
+            .claim_relay_invite(tenant.community(), &token_hash, &claimer_hex)
             .await
             .map_err(|e| internal_error(&format!("v2 invite claim: {e}")))?;
 
@@ -416,6 +417,20 @@ mod tests {
             assert!(!claim_key_rate_limited(&cache, key));
         }
         assert!(claim_key_rate_limited(&cache, key));
+    }
+
+    #[test]
+    fn mint_request_rejects_unknown_fields_and_typos() {
+        for body in [
+            serde_json::json!({ "maxUses": 1 }),
+            serde_json::json!({ "ttlSeconds": 3600 }),
+            serde_json::json!({ "max_uses": 1, "extra": true }),
+        ] {
+            assert!(
+                serde_json::from_value::<super::MintInviteRequest>(body.clone()).is_err(),
+                "unknown key must fail closed: {body}"
+            );
+        }
     }
 
     #[test]
@@ -688,12 +703,25 @@ mod tests {
             .await
             .expect("seed owner");
 
+        let verification_pool = sqlx::PgPool::connect(&state.config.database_url)
+            .await
+            .expect("verification pool");
+        let invites_before: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM relay_invites WHERE community_id = $1")
+                .bind(community.id.as_uuid())
+                .fetch_one(&verification_pool)
+                .await
+                .expect("count invites before hostile requests");
+
         for body in [
             serde_json::json!({ "max_uses": 0 }),
             serde_json::json!({ "max_uses": -1 }),
             serde_json::json!({ "max_uses": MAX_INVITE_USES + 1 }),
             serde_json::json!({ "ttl_secs": MIN_INVITE_TTL_SECS - 1 }),
             serde_json::json!({ "ttl_secs": MAX_INVITE_TTL_SECS + 1 }),
+            serde_json::json!({ "maxUses": 1 }),
+            serde_json::json!({ "ttlSeconds": MIN_INVITE_TTL_SECS }),
+            serde_json::json!({ "max_uses": 1, "extra": true }),
         ] {
             let response = post_json(
                 state.clone(),
@@ -705,6 +733,16 @@ mod tests {
             .await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
         }
+        let invites_after: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM relay_invites WHERE community_id = $1")
+                .bind(community.id.as_uuid())
+                .fetch_one(&verification_pool)
+                .await
+                .expect("count invites after hostile requests");
+        assert_eq!(
+            invites_after, invites_before,
+            "invalid or misspelled fields must not mint an unlimited invite"
+        );
 
         for body in [
             serde_json::json!({}),

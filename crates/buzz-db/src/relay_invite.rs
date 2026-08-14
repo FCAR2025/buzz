@@ -201,7 +201,6 @@ pub async fn claim_relay_invite(
     community: CommunityId,
     token_hash: &[u8; 32],
     claimer_pubkey: &str,
-    _policy_version: Option<&str>,
 ) -> Result<ClaimOutcome> {
     let mut tx = pool.begin().await?;
 
@@ -434,7 +433,7 @@ mod tests {
         let hash = hash_v2_code(&invite.code);
 
         assert_eq!(
-            claim_relay_invite(&pool, community, &hash, &first, None)
+            claim_relay_invite(&pool, community, &hash, &first)
                 .await
                 .expect("first claim"),
             ClaimOutcome::Joined {
@@ -443,7 +442,7 @@ mod tests {
             }
         );
         assert_eq!(
-            claim_relay_invite(&pool, community, &hash, &first, None)
+            claim_relay_invite(&pool, community, &hash, &first)
                 .await
                 .expect("idempotent retry"),
             ClaimOutcome::AlreadyMember {
@@ -452,7 +451,7 @@ mod tests {
             }
         );
         assert_eq!(
-            claim_relay_invite(&pool, community, &hash, &second, None)
+            claim_relay_invite(&pool, community, &hash, &second)
                 .await
                 .expect("exhausted claim"),
             ClaimOutcome::Exhausted
@@ -480,8 +479,8 @@ mod tests {
         let hash = hash_v2_code(&invite.code);
 
         let (first_outcome, second_outcome) = tokio::join!(
-            claim_relay_invite(&pool, community, &hash, &first, None),
-            claim_relay_invite(&pool, community, &hash, &second, None),
+            claim_relay_invite(&pool, community, &hash, &first),
+            claim_relay_invite(&pool, community, &hash, &second),
         );
         let outcomes = [
             first_outcome.expect("first concurrent claim"),
@@ -524,7 +523,7 @@ mod tests {
         let hash = hash_v2_code(&invite.code);
 
         assert_eq!(
-            claim_relay_invite(&pool, community_b, &hash, &test_pubkey(), None)
+            claim_relay_invite(&pool, community_b, &hash, &test_pubkey())
                 .await
                 .expect("cross-tenant claim"),
             ClaimOutcome::Invalid
@@ -540,7 +539,7 @@ mod tests {
         .await
         .expect("expire invite");
         assert_eq!(
-            claim_relay_invite(&pool, community_a, &hash, &test_pubkey(), None)
+            claim_relay_invite(&pool, community_a, &hash, &test_pubkey())
                 .await
                 .expect("expired claim"),
             ClaimOutcome::Expired
@@ -600,7 +599,7 @@ mod tests {
 
         for (expected_count, pubkey) in [(1, test_pubkey()), (2, test_pubkey())] {
             assert_eq!(
-                claim_relay_invite(&pool, community, &hash, &pubkey, None)
+                claim_relay_invite(&pool, community, &hash, &pubkey)
                     .await
                     .expect("unlimited claim"),
                 ClaimOutcome::Joined {

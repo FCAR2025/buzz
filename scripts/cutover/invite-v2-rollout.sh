@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DEFAULT_MIGRATION="$SCRIPT_DIR/../../migrations/0025_relay_invites.sql"
-EXPECTED_MIGRATION_SHA384=d4fdfc8bc8c9d75f7b812f40d533af80de1053fdd0d95c99b6ff6376e7d7090a8b514ef4e0e9d31aba258e6e7833b1c5
+EXPECTED_MIGRATION_SHA384=5ed27780d08863488ec5cddd2661f3619c490cf740f6dd13f242da113efe7e1212b2f2d3a9b548c472f3382ad9f7a155
 DEFAULT_OLD_IMAGE='ghcr.io/block/buzz:0.2.0@sha256:a0f67203d71d15d237fa7517788799957c30c8acdb81cbcff711e07e951c2710'
 DEFAULT_BASE_COMMIT=0d9be2fde1fc18e57da8f2ca229cc01699867550
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
@@ -26,6 +26,7 @@ OLD_OVERLAY=${BUZZ_OLD_OVERLAY:-/etc/buzz/invite-v2-old-guard.yml}
 CANDIDATE_OVERLAY=${BUZZ_CANDIDATE_OVERLAY:-/etc/buzz/invite-v2-candidate.yml}
 MIGRATION=${BUZZ_MIGRATION_FILE:-$DEFAULT_MIGRATION}
 BACKUP_POINTER=${BUZZ_BACKUP_POINTER:-/etc/buzz/invite-v2-backup-path}
+BACKUP_PATH_PREFIX=${BUZZ_BACKUP_PATH_PREFIX:-/root/buzz-rollbacks/invite-v2-}
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -36,15 +37,61 @@ require_root_for_live_action() {
   [[ ${BUZZ_ALLOW_NON_ROOT:-0} == 1 || $(id -u) == 0 ]] || die 'live rollout actions require root'
 }
 
+expected_owner_uid() {
+  if [[ -n ${BUZZ_EXPECTED_OWNER_UID:-} ]]; then
+    printf '%s\n' "$BUZZ_EXPECTED_OWNER_UID"
+  elif [[ ${BUZZ_ALLOW_NON_ROOT:-0} == 1 ]]; then
+    id -u
+  else
+    printf '0\n'
+  fi
+}
+
 assert_backup_verified() {
   [[ ${BUZZ_SKIP_BACKUP_GUARD:-0} == 1 ]] && return 0
   [[ -f "$BACKUP_POINTER" ]] || die "verified backup required; pointer missing: $BACKUP_POINTER"
-  local backup_dir
+  local backup_dir artifact config_file owner expected_uid mode manifest_entry
+  local -a required_artifacts
+  expected_uid=$(expected_owner_uid)
+  owner=$(stat -c '%u' "$BACKUP_POINTER")
+  mode=$(stat -c '%a' "$BACKUP_POINTER")
+  [[ "$owner" == "$expected_uid" && "$mode" == 600 ]] ||
+    die 'verified backup required; pointer must be trusted-owner mode 0600'
   IFS= read -r backup_dir <"$BACKUP_POINTER"
-  [[ "$backup_dir" == /root/buzz-rollbacks/invite-v2-* && -d "$backup_dir" ]] ||
+  [[ "$backup_dir" == "$BACKUP_PATH_PREFIX"* && -d "$backup_dir" ]] ||
     die 'verified backup required; pointer target is invalid'
+  owner=$(stat -c '%u' "$backup_dir")
+  mode=$(stat -c '%a' "$backup_dir")
+  [[ "$owner" == "$expected_uid" && "$mode" == 700 ]] ||
+    die 'verified backup required; directory must be trusted-owner mode 0700'
+
+  required_artifacts=(compose.yml etc-buzz.tar relay-container-inspect.json database-preimage.dump)
+  for config_file in ${BUZZ_BACKUP_CONFIG_FILES:-/etc/buzz/.env /etc/buzz/nginx-relay.conf}; do
+    required_artifacts+=("$(basename -- "$config_file")")
+  done
+  required_artifacts+=(SHA256SUMS)
+  for artifact in "${required_artifacts[@]}"; do
+    [[ -f "$backup_dir/$artifact" ]] || die "required backup artifact missing: $artifact"
+    owner=$(stat -c '%u' "$backup_dir/$artifact")
+    mode=$(stat -c '%a' "$backup_dir/$artifact")
+    [[ "$owner" == "$expected_uid" && "$mode" == 600 ]] ||
+      die "verified backup required; $artifact must be trusted-owner mode 0600"
+  done
+
+  for artifact in "${required_artifacts[@]}"; do
+    [[ "$artifact" == SHA256SUMS ]] && continue
+    manifest_entry=$(grep -c -F " ./$artifact" "$backup_dir/SHA256SUMS" || true)
+    [[ "$manifest_entry" == 1 ]] ||
+      die "verified backup required; manifest must attest exactly one ./$artifact"
+  done
   (cd "$backup_dir" && sha256sum --check --status SHA256SUMS) ||
     die 'verified backup required; SHA256 preimage attestation failed'
+  tar -tf "$backup_dir/etc-buzz.tar" >/dev/null ||
+    die 'verified backup required; etc-buzz archive is unreadable'
+  jq -e 'type == "array" and length >= 1' "$backup_dir/relay-container-inspect.json" >/dev/null ||
+    die 'verified backup required; relay container inspect is unreadable'
+  pg_restore --list "$backup_dir/database-preimage.dump" >/dev/null ||
+    die 'verified backup required; PostgreSQL dump restore preflight failed'
 }
 
 migration_checksum() {
@@ -92,6 +139,35 @@ load_candidate_receipt() {
   [[ "$RECEIPT_PATCH_SHA256" =~ ^[0-9a-f]{64}$ ]] || die 'candidate receipt patch hash is invalid'
 }
 
+verify_source_lineage() {
+  local source=${1:?trusted candidate source checkout required}
+  local head tree patch owner
+  [[ -d "$source" ]] || die "candidate source lineage mismatch: checkout missing: $source"
+  git -C "$source" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+    die 'candidate source lineage mismatch: source is not a Git worktree'
+  owner=$(stat -c '%u' "$source")
+  [[ "$owner" == "$(expected_owner_uid)" ]] ||
+    die 'candidate source lineage mismatch: source checkout owner is not trusted'
+  [[ ${BUZZ_ALLOW_DIRTY_SOURCE:-0} == 1 || -z $(git -C "$source" status --porcelain) ]] ||
+    die 'candidate source lineage mismatch: source checkout is dirty'
+  git -C "$source" cat-file -e "${RECEIPT_COMMIT}^{commit}" 2>/dev/null ||
+    die 'candidate source lineage mismatch: candidate commit is absent'
+  git -C "$source" cat-file -e "${RECEIPT_BASE}^{commit}" 2>/dev/null ||
+    die 'candidate source lineage mismatch: base commit is absent'
+  head=$(git -C "$source" rev-parse HEAD)
+  [[ "$head" == "$RECEIPT_COMMIT" ]] ||
+    die "candidate source lineage mismatch: checkout HEAD is $head, expected $RECEIPT_COMMIT"
+  git -C "$source" merge-base --is-ancestor "$RECEIPT_BASE" "$RECEIPT_COMMIT" ||
+    die 'candidate source lineage mismatch: base is not an ancestor of candidate'
+  tree=$(git -C "$source" rev-parse "${RECEIPT_COMMIT}^{tree}")
+  [[ "$tree" == "$RECEIPT_TREE" ]] ||
+    die "candidate source lineage mismatch: tree is $tree, expected $RECEIPT_TREE"
+  patch=$(git -C "$source" diff --binary --full-index --no-ext-diff \
+    "$RECEIPT_BASE" "$RECEIPT_COMMIT" | sha256sum | cut -d' ' -f1)
+  [[ "$patch" == "$RECEIPT_PATCH_SHA256" ]] ||
+    die "candidate source lineage mismatch: patch SHA-256 is $patch, expected $RECEIPT_PATCH_SHA256"
+}
+
 image_id() {
   docker image inspect --format='{{.Id}}' "$1"
 }
@@ -101,8 +177,11 @@ image_revision() {
 }
 
 verify_candidate_receipt() {
-  local receipt=${1:?candidate receipt required} actual_id actual_revision
+  local receipt=${1:?candidate receipt required}
+  local source=${2:?trusted candidate source checkout required}
+  local actual_id actual_revision
   load_candidate_receipt "$receipt"
+  verify_source_lineage "$source"
   actual_id=$(image_id "$RECEIPT_IMAGE_REF")
   [[ "$actual_id" == "$RECEIPT_IMAGE_ID" ]] ||
     die "candidate image ID mismatch: expected $RECEIPT_IMAGE_ID, got ${actual_id:-missing}"
@@ -145,10 +224,9 @@ write_candidate_receipt() {
     printf 'candidate_tree=%s\n' "$tree"
     printf 'base_commit=%s\n' "$base"
     printf 'patch_sha256=%s\n' "$patch"
-    printf 'patch_stream=git diff --binary --full-index --no-ext-diff %s %s\n' "$base" "$commit"
   } >"$output"
   chmod 0600 "$output"
-  verify_candidate_receipt "$output"
+  verify_candidate_receipt "$output" "$REPO_ROOT"
 }
 
 render_overlay() {
@@ -322,8 +400,8 @@ write_manifest() {
 backup_preimage() {
   require_root_for_live_action
   local backup_dir=${1:?backup directory required}
-  [[ "$backup_dir" == /root/buzz-rollbacks/invite-v2-* ]] ||
-    die 'backup directory must be an explicit /root/buzz-rollbacks/invite-v2-* path'
+  [[ "$backup_dir" == "$BACKUP_PATH_PREFIX"* ]] ||
+    die "backup directory must use the explicit prefix $BACKUP_PATH_PREFIX"
   [[ ! -e "$backup_dir" ]] || die "backup target already exists: $backup_dir"
 
   install -d -m 0700 "$backup_dir"
@@ -331,9 +409,8 @@ backup_preimage() {
   tar -C /etc -cf "$backup_dir/etc-buzz.tar" buzz
   chmod 0600 "$backup_dir/etc-buzz.tar"
   for config_file in ${BUZZ_BACKUP_CONFIG_FILES:-/etc/buzz/.env /etc/buzz/nginx-relay.conf}; do
-    if [[ -f "$config_file" ]]; then
-      install -m 0600 "$config_file" "$backup_dir/$(basename -- "$config_file")"
-    fi
+    [[ -f "$config_file" ]] || die "required backup source missing: $config_file"
+    install -m 0600 "$config_file" "$backup_dir/$(basename -- "$config_file")"
   done
   docker inspect "$RELAY_CONTAINER" >"$backup_dir/relay-container-inspect.json"
   chmod 0600 "$backup_dir/relay-container-inspect.json"
@@ -343,6 +420,8 @@ backup_preimage() {
   write_manifest "$backup_dir"
   umask 077
   printf '%s\n' "$backup_dir" >"$BACKUP_POINTER"
+  chmod 0600 "$BACKUP_POINTER"
+  assert_backup_verified
   printf '%s\n' "$backup_dir"
 }
 
@@ -385,7 +464,8 @@ deploy_candidate() {
   require_root_for_live_action
   assert_backup_verified
   local receipt=${1:?candidate receipt required}
-  verify_candidate_receipt "$receipt"
+  local source=${2:?trusted candidate source checkout required}
+  verify_candidate_receipt "$receipt" "$source"
   assert_auto_migrate_off "$RELAY_CONTAINER"
   verify_migration_record
   render_overlay "$RECEIPT_IMAGE_ID" "$CANDIDATE_OVERLAY"
@@ -407,14 +487,14 @@ usage() {
     '  invite-v2-rollout.sh migration-checksum [MIGRATION]' \
     '  invite-v2-rollout.sh patch-hash BASE_COMMIT CANDIDATE_COMMIT' \
     '  invite-v2-rollout.sh write-candidate-receipt IMAGE_REF OUTPUT [BASE_COMMIT]' \
-    '  invite-v2-rollout.sh verify-candidate-receipt RECEIPT' \
+    '  invite-v2-rollout.sh verify-candidate-receipt RECEIPT TRUSTED_SOURCE_CHECKOUT' \
     '  invite-v2-rollout.sh assert-running-candidate RECEIPT [CONTAINER]' \
     '  invite-v2-rollout.sh assert-auto-migrate-off CONTAINER' \
     '  invite-v2-rollout.sh assert-backup' \
     '  invite-v2-rollout.sh backup /root/buzz-rollbacks/invite-v2-TIMESTAMP' \
     '  invite-v2-rollout.sh stage-old-guard' \
     '  invite-v2-rollout.sh apply-migration' \
-    '  invite-v2-rollout.sh deploy-candidate RECEIPT' \
+    '  invite-v2-rollout.sh deploy-candidate RECEIPT TRUSTED_SOURCE_CHECKOUT' \
     '  invite-v2-rollout.sh rollback' \
     '  invite-v2-rollout.sh verify-migration' \
     '  invite-v2-rollout.sh capture-invariants OUTPUT' \
@@ -428,14 +508,14 @@ case "$command" in
   migration-checksum) migration_checksum "${2:-$MIGRATION}" ;;
   patch-hash) patch_hash "${2:?base commit required}" "${3:?candidate commit required}" ;;
   write-candidate-receipt) write_candidate_receipt "${2:?image reference required}" "${3:?output required}" "${4:-$DEFAULT_BASE_COMMIT}" ;;
-  verify-candidate-receipt) verify_candidate_receipt "${2:?candidate receipt required}" ;;
+  verify-candidate-receipt) verify_candidate_receipt "${2:?candidate receipt required}" "${3:?trusted candidate source checkout required}" ;;
   assert-running-candidate) assert_running_candidate "${2:?candidate receipt required}" "${3:-$RELAY_CONTAINER}" ;;
   assert-auto-migrate-off) assert_auto_migrate_off "${2:?container required}" ;;
   assert-backup) assert_backup_verified ;;
   backup) backup_preimage "${2:?backup directory required}" ;;
   stage-old-guard) stage_old_guard ;;
   apply-migration) apply_migration ;;
-  deploy-candidate) deploy_candidate "${2:?candidate receipt required}" ;;
+  deploy-candidate) deploy_candidate "${2:?candidate receipt required}" "${3:?trusted candidate source checkout required}" ;;
   rollback) rollback_old ;;
   verify-migration) verify_migration_record ;;
   capture-invariants) capture_invariants "${2:?output file required}" ;;
