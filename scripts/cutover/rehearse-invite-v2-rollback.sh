@@ -4,7 +4,11 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROLLOUT="$SCRIPT_DIR/invite-v2-rollout.sh"
 OLD_IMAGE=${BUZZ_REHEARSAL_OLD_IMAGE:-ghcr.io/block/buzz:0.2.0@sha256:a0f67203d71d15d237fa7517788799957c30c8acdb81cbcff711e07e951c2710}
-CANDIDATE_IMAGE=${BUZZ_REHEARSAL_CANDIDATE_IMAGE:-buzz-relay-invite-v2:117a5df1d}
+CANDIDATE_RECEIPT=${BUZZ_REHEARSAL_CANDIDATE_RECEIPT:-/root/buzz-invite-v2-final/candidate.receipt}
+
+"$ROLLOUT" verify-candidate-receipt "$CANDIDATE_RECEIPT"
+CANDIDATE_IMAGE=$(grep -E '^candidate_image_id=' "$CANDIDATE_RECEIPT")
+CANDIDATE_IMAGE=${CANDIDATE_IMAGE#*=}
 
 run_id="invite-v2-rehearsal-$$"
 network="$run_id"
@@ -142,6 +146,7 @@ fi
 printf '5/6 candidate serves schema 25 with auto-migrate disabled\n'
 relay_run "$CANDIDATE_IMAGE" false
 wait_relay
+BUZZ_ALLOW_NON_ROOT=1 "$ROLLOUT" assert-running-candidate "$CANDIDATE_RECEIPT" "$relay"
 [[ $(docker exec "$postgres" psql -U buzz -d buzz -Atc 'select count(*) from relay_invites') == 0 ]]
 
 printf '6/6 old base rollback serves schema 25 with auto-migrate disabled\n'

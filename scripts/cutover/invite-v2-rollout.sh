@@ -10,6 +10,8 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DEFAULT_MIGRATION="$SCRIPT_DIR/../../migrations/0025_relay_invites.sql"
 EXPECTED_MIGRATION_SHA384=d4fdfc8bc8c9d75f7b812f40d533af80de1053fdd0d95c99b6ff6376e7d7090a8b514ef4e0e9d31aba258e6e7833b1c5
 DEFAULT_OLD_IMAGE='ghcr.io/block/buzz:0.2.0@sha256:a0f67203d71d15d237fa7517788799957c30c8acdb81cbcff711e07e951c2710'
+DEFAULT_BASE_COMMIT=0d9be2fde1fc18e57da8f2ca229cc01699867550
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
 COMPOSE_FILE=${BUZZ_COMPOSE_FILE:-/etc/buzz/compose.yml}
 PROJECT=${BUZZ_PROJECT:-buzz-prod}
@@ -56,6 +58,97 @@ verify_source_migration() {
   actual=$(migration_checksum "$MIGRATION")
   [[ "$actual" == "$EXPECTED_MIGRATION_SHA384" ]] ||
     die "migration checksum mismatch: expected $EXPECTED_MIGRATION_SHA384, got $actual"
+}
+
+patch_hash() {
+  local base=${1:?base commit required} candidate=${2:?candidate commit required}
+  git -C "$REPO_ROOT" diff --binary --full-index --no-ext-diff "$base" "$candidate" \
+    | sha256sum | cut -d' ' -f1
+}
+
+receipt_value() {
+  local receipt=$1 key=$2 count value
+  count=$(grep -c -E "^${key}=" "$receipt" || true)
+  [[ "$count" == 1 ]] || die "candidate receipt must contain exactly one $key"
+  value=$(grep -E "^${key}=" "$receipt")
+  printf '%s\n' "${value#*=}"
+}
+
+load_candidate_receipt() {
+  local receipt=${1:?candidate receipt required}
+  [[ -f "$receipt" ]] || die "candidate receipt not found: $receipt"
+  RECEIPT_IMAGE_REF=$(receipt_value "$receipt" candidate_image_ref)
+  RECEIPT_IMAGE_ID=$(receipt_value "$receipt" candidate_image_id)
+  RECEIPT_REVISION=$(receipt_value "$receipt" candidate_oci_revision)
+  RECEIPT_COMMIT=$(receipt_value "$receipt" candidate_commit)
+  RECEIPT_TREE=$(receipt_value "$receipt" candidate_tree)
+  RECEIPT_BASE=$(receipt_value "$receipt" base_commit)
+  RECEIPT_PATCH_SHA256=$(receipt_value "$receipt" patch_sha256)
+  [[ "$RECEIPT_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'candidate receipt image ID is invalid'
+  [[ "$RECEIPT_REVISION" =~ ^[0-9a-f]{40}$ ]] || die 'candidate receipt OCI revision is invalid'
+  [[ "$RECEIPT_COMMIT" == "$RECEIPT_REVISION" ]] || die 'candidate receipt commit and OCI revision differ'
+  [[ "$RECEIPT_TREE" =~ ^[0-9a-f]{40}$ ]] || die 'candidate receipt tree is invalid'
+  [[ "$RECEIPT_BASE" =~ ^[0-9a-f]{40}$ ]] || die 'candidate receipt base commit is invalid'
+  [[ "$RECEIPT_PATCH_SHA256" =~ ^[0-9a-f]{64}$ ]] || die 'candidate receipt patch hash is invalid'
+}
+
+image_id() {
+  docker image inspect --format='{{.Id}}' "$1"
+}
+
+image_revision() {
+  docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' "$1"
+}
+
+verify_candidate_receipt() {
+  local receipt=${1:?candidate receipt required} actual_id actual_revision
+  load_candidate_receipt "$receipt"
+  actual_id=$(image_id "$RECEIPT_IMAGE_REF")
+  [[ "$actual_id" == "$RECEIPT_IMAGE_ID" ]] ||
+    die "candidate image ID mismatch: expected $RECEIPT_IMAGE_ID, got ${actual_id:-missing}"
+  actual_revision=$(image_revision "$RECEIPT_IMAGE_REF")
+  [[ "$actual_revision" == "$RECEIPT_REVISION" ]] ||
+    die "candidate OCI revision mismatch: expected $RECEIPT_REVISION, got ${actual_revision:-missing}"
+}
+
+assert_running_candidate() {
+  local receipt=${1:?candidate receipt required} container=${2:-$RELAY_CONTAINER}
+  local running_id running_revision
+  load_candidate_receipt "$receipt"
+  running_id=$(docker inspect --format='{{.Image}}' "$container")
+  [[ "$running_id" == "$RECEIPT_IMAGE_ID" ]] ||
+    die "running candidate image ID mismatch: expected $RECEIPT_IMAGE_ID, got ${running_id:-missing}"
+  running_revision=$(image_revision "$running_id")
+  [[ "$running_revision" == "$RECEIPT_REVISION" ]] ||
+    die "running candidate OCI revision mismatch: expected $RECEIPT_REVISION, got ${running_revision:-missing}"
+}
+
+write_candidate_receipt() {
+  local image_ref=${1:?candidate image reference required}
+  local output=${2:?candidate receipt output required}
+  local base=${3:-$DEFAULT_BASE_COMMIT} commit tree id revision patch
+  [[ ! -e "$output" ]] || die "candidate receipt already exists: $output"
+  commit=$(git -C "$REPO_ROOT" rev-parse HEAD)
+  tree=$(git -C "$REPO_ROOT" rev-parse 'HEAD^{tree}')
+  id=$(image_id "$image_ref")
+  revision=$(image_revision "$image_ref")
+  [[ "$revision" == "$commit" ]] ||
+    die "candidate OCI revision mismatch: expected final commit $commit, got ${revision:-missing}"
+  patch=$(patch_hash "$base" "$commit")
+  umask 077
+  mkdir -p -- "$(dirname -- "$output")"
+  {
+    printf 'candidate_image_ref=%s\n' "$image_ref"
+    printf 'candidate_image_id=%s\n' "$id"
+    printf 'candidate_oci_revision=%s\n' "$revision"
+    printf 'candidate_commit=%s\n' "$commit"
+    printf 'candidate_tree=%s\n' "$tree"
+    printf 'base_commit=%s\n' "$base"
+    printf 'patch_sha256=%s\n' "$patch"
+    printf 'patch_stream=git diff --binary --full-index --no-ext-diff %s %s\n' "$base" "$commit"
+  } >"$output"
+  chmod 0600 "$output"
+  verify_candidate_receipt "$output"
 }
 
 render_overlay() {
@@ -291,11 +384,13 @@ apply_migration() {
 deploy_candidate() {
   require_root_for_live_action
   assert_backup_verified
-  local image=${1:?candidate image digest required}
+  local receipt=${1:?candidate receipt required}
+  verify_candidate_receipt "$receipt"
   assert_auto_migrate_off "$RELAY_CONTAINER"
   verify_migration_record
-  render_overlay "$image" "$CANDIDATE_OVERLAY"
+  render_overlay "$RECEIPT_IMAGE_ID" "$CANDIDATE_OVERLAY"
   compose_relay_up "$CANDIDATE_OVERLAY"
+  assert_running_candidate "$receipt" "$RELAY_CONTAINER"
 }
 
 rollback_old() {
@@ -310,12 +405,16 @@ usage() {
     'usage:' \
     '  invite-v2-rollout.sh render-overlay IMAGE@sha256:DIGEST OUTPUT' \
     '  invite-v2-rollout.sh migration-checksum [MIGRATION]' \
+    '  invite-v2-rollout.sh patch-hash BASE_COMMIT CANDIDATE_COMMIT' \
+    '  invite-v2-rollout.sh write-candidate-receipt IMAGE_REF OUTPUT [BASE_COMMIT]' \
+    '  invite-v2-rollout.sh verify-candidate-receipt RECEIPT' \
+    '  invite-v2-rollout.sh assert-running-candidate RECEIPT [CONTAINER]' \
     '  invite-v2-rollout.sh assert-auto-migrate-off CONTAINER' \
     '  invite-v2-rollout.sh assert-backup' \
     '  invite-v2-rollout.sh backup /root/buzz-rollbacks/invite-v2-TIMESTAMP' \
     '  invite-v2-rollout.sh stage-old-guard' \
     '  invite-v2-rollout.sh apply-migration' \
-    '  invite-v2-rollout.sh deploy-candidate IMAGE@sha256:DIGEST' \
+    '  invite-v2-rollout.sh deploy-candidate RECEIPT' \
     '  invite-v2-rollout.sh rollback' \
     '  invite-v2-rollout.sh verify-migration' \
     '  invite-v2-rollout.sh capture-invariants OUTPUT' \
@@ -327,12 +426,16 @@ command=${1:-}
 case "$command" in
   render-overlay) render_overlay "${2:?image required}" "${3:?output required}" ;;
   migration-checksum) migration_checksum "${2:-$MIGRATION}" ;;
+  patch-hash) patch_hash "${2:?base commit required}" "${3:?candidate commit required}" ;;
+  write-candidate-receipt) write_candidate_receipt "${2:?image reference required}" "${3:?output required}" "${4:-$DEFAULT_BASE_COMMIT}" ;;
+  verify-candidate-receipt) verify_candidate_receipt "${2:?candidate receipt required}" ;;
+  assert-running-candidate) assert_running_candidate "${2:?candidate receipt required}" "${3:-$RELAY_CONTAINER}" ;;
   assert-auto-migrate-off) assert_auto_migrate_off "${2:?container required}" ;;
   assert-backup) assert_backup_verified ;;
   backup) backup_preimage "${2:?backup directory required}" ;;
   stage-old-guard) stage_old_guard ;;
   apply-migration) apply_migration ;;
-  deploy-candidate) deploy_candidate "${2:?candidate image digest required}" ;;
+  deploy-candidate) deploy_candidate "${2:?candidate receipt required}" ;;
   rollback) rollback_old ;;
   verify-migration) verify_migration_record ;;
   capture-invariants) capture_invariants "${2:?output file required}" ;;

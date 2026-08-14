@@ -361,7 +361,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{claim_key_rate_limited, CLAIM_RATE_LIMIT, MAX_INVITE_USES, MIN_INVITE_TTL_SECS};
+    use super::{
+        claim_key_rate_limited, validate_v2_code, CLAIM_RATE_LIMIT, MAX_INVITE_USES,
+        MIN_INVITE_TTL_SECS,
+    };
     use axum::{
         body::{to_bytes, Body},
         http::{header, Request, StatusCode},
@@ -707,7 +710,6 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({ "max_uses": null }),
             serde_json::json!({ "max_uses": 1 }),
-            serde_json::json!({ "max_uses": MAX_INVITE_USES }),
             serde_json::json!({ "ttl_secs": MIN_INVITE_TTL_SECS }),
             serde_json::json!({ "ttl_secs": MAX_INVITE_TTL_SECS }),
         ] {
@@ -721,6 +723,24 @@ mod tests {
             .await;
             assert_eq!(response.status(), StatusCode::OK, "{body}");
         }
+
+        let response = post_json(
+            state,
+            &host,
+            "/api/invites",
+            &owner,
+            serde_json::json!({ "max_uses": 10 }).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = read_json(response).await;
+        let code = response["code"].as_str().expect("string invite code");
+        validate_v2_code(code).expect("canonical v2 invite code");
+        assert!(response["expires_at"].as_u64().is_some(), "numeric expiry");
+        assert_eq!(response["max_uses"].as_i64(), Some(10));
+        assert_eq!(response["uses_remaining"].as_i64(), Some(10));
+        let expected_url = format!("https://{host}/invite/{code}");
+        assert_eq!(response["url"].as_str(), Some(expected_url.as_str()));
     }
 
     #[tokio::test]
