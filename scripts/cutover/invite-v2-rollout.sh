@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Rollout/rollback guard for migration 0025.  The old 0.2.0 relay embeds only
+# migrations 1-6 and must never execute SQLx migration validation after 0025
+# has been recorded.  Every serving image therefore runs with
+# BUZZ_AUTO_MIGRATE=false before, during, and after this rollout.
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+DEFAULT_MIGRATION="$SCRIPT_DIR/../../migrations/0025_relay_invites.sql"
+EXPECTED_MIGRATION_SHA384=d4fdfc8bc8c9d75f7b812f40d533af80de1053fdd0d95c99b6ff6376e7d7090a8b514ef4e0e9d31aba258e6e7833b1c5
+DEFAULT_OLD_IMAGE='ghcr.io/block/buzz:0.2.0@sha256:a0f67203d71d15d237fa7517788799957c30c8acdb81cbcff711e07e951c2710'
+
+COMPOSE_FILE=${BUZZ_COMPOSE_FILE:-/etc/buzz/compose.yml}
+PROJECT=${BUZZ_PROJECT:-buzz-prod}
+RELAY_SERVICE=${BUZZ_RELAY_SERVICE:-relay}
+RELAY_CONTAINER=${BUZZ_RELAY_CONTAINER:-buzz-prod-relay-1}
+POSTGRES_CONTAINER=${BUZZ_POSTGRES_CONTAINER:-buzz-prod-postgres-1}
+DB_USER=${BUZZ_DB_USER:-buzz}
+DB_NAME=${BUZZ_DB_NAME:-buzz}
+HEALTH_URL=${BUZZ_HEALTH_URL:-http://127.0.0.1:8080/_readiness}
+OLD_IMAGE=${BUZZ_OLD_IMAGE:-$DEFAULT_OLD_IMAGE}
+OLD_OVERLAY=${BUZZ_OLD_OVERLAY:-/etc/buzz/invite-v2-old-guard.yml}
+CANDIDATE_OVERLAY=${BUZZ_CANDIDATE_OVERLAY:-/etc/buzz/invite-v2-candidate.yml}
+MIGRATION=${BUZZ_MIGRATION_FILE:-$DEFAULT_MIGRATION}
+BACKUP_POINTER=${BUZZ_BACKUP_POINTER:-/etc/buzz/invite-v2-backup-path}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_root_for_live_action() {
+  [[ ${BUZZ_ALLOW_NON_ROOT:-0} == 1 || $(id -u) == 0 ]] || die 'live rollout actions require root'
+}
+
+assert_backup_verified() {
+  [[ ${BUZZ_SKIP_BACKUP_GUARD:-0} == 1 ]] && return 0
+  [[ -f "$BACKUP_POINTER" ]] || die "verified backup required; pointer missing: $BACKUP_POINTER"
+  local backup_dir
+  IFS= read -r backup_dir <"$BACKUP_POINTER"
+  [[ "$backup_dir" == /root/buzz-rollbacks/invite-v2-* && -d "$backup_dir" ]] ||
+    die 'verified backup required; pointer target is invalid'
+  (cd "$backup_dir" && sha256sum --check --status SHA256SUMS) ||
+    die 'verified backup required; SHA256 preimage attestation failed'
+}
+
+migration_checksum() {
+  local migration_file=$1
+  [[ -f "$migration_file" ]] || die "migration file not found: $migration_file"
+  openssl dgst -sha384 -binary "$migration_file" | od -An -vtx1 | tr -d ' \n'
+}
+
+verify_source_migration() {
+  local actual
+  actual=$(migration_checksum "$MIGRATION")
+  [[ "$actual" == "$EXPECTED_MIGRATION_SHA384" ]] ||
+    die "migration checksum mismatch: expected $EXPECTED_MIGRATION_SHA384, got $actual"
+}
+
+render_overlay() {
+  local image=$1 output=$2
+  [[ "$image" == *@sha256:* || "$image" == sha256:* ]] || die 'image must be pinned by digest or immutable image ID'
+  umask 077
+  mkdir -p -- "$(dirname -- "$output")"
+  {
+    printf 'services:\n'
+    printf '  %s:\n' "$RELAY_SERVICE"
+    printf '    image: %s\n' "$image"
+    printf '    environment:\n'
+    printf '      BUZZ_AUTO_MIGRATE: "false"\n'
+  } >"$output"
+}
+
+container_env_value() {
+  local container=$1 key=$2 line
+  while IFS= read -r line; do
+    case "$line" in
+      "$key="*) printf '%s\n' "${line#*=}"; return 0 ;;
+    esac
+  done < <(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$container")
+  return 1
+}
+
+assert_auto_migrate_off() {
+  local container=$1 value
+  value=$(container_env_value "$container" BUZZ_AUTO_MIGRATE || true)
+  [[ "$value" == false || "$value" == 0 ]] ||
+    die "BUZZ_AUTO_MIGRATE must be false in $container; observed ${value:-unset}"
+}
+
+wait_healthy() {
+  local _
+  for _ in $(seq 1 60); do
+    if curl --fail --silent --show-error "$HEALTH_URL" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  die "relay readiness did not become healthy: $HEALTH_URL"
+}
+
+compose_relay_up() {
+  local overlay=$1
+  docker compose --project-name "$PROJECT" -f "$COMPOSE_FILE" -f "$overlay" \
+    up -d --no-deps "$RELAY_SERVICE"
+  assert_auto_migrate_off "$RELAY_CONTAINER"
+  wait_healthy
+}
+
+psql_scalar() {
+  docker exec "$POSTGRES_CONTAINER" psql -X -v ON_ERROR_STOP=1 \
+    -U "$DB_USER" -d "$DB_NAME" -Atc "$1"
+}
+
+verify_migration_record() {
+  local record table_name
+  record=$(psql_scalar "SELECT success::text || ':' || encode(checksum, 'hex') FROM _sqlx_migrations WHERE version = 25")
+  [[ "$record" == "true:$EXPECTED_MIGRATION_SHA384" ]] ||
+    die "migration 25 record mismatch: ${record:-missing}"
+  table_name=$(psql_scalar "SELECT COALESCE(to_regclass('public.relay_invites')::text, '')")
+  [[ "$table_name" == relay_invites ]] || die 'relay_invites table is missing'
+}
+
+invariant_value() {
+  local file=$1 key=$2
+  grep -E "^${key}=" "$file" | head -n1 | cut -d= -f2-
+}
+
+compare_invariants() {
+  local before=${1:?before invariant file required} after=${2:?after invariant file required}
+  [[ -f "$before" && -f "$after" ]] || die 'invariant files must exist'
+  [[ $(invariant_value "$before" migrations) == 1,2,3,4,5,6 ]] ||
+    die 'invariant drift: preimage migrations are not exactly 1-6'
+  [[ $(invariant_value "$after" migrations) == 1,2,3,4,5,6,25 ]] ||
+    die 'invariant drift: postimage migrations are not exactly 1-6,25'
+  [[ $(invariant_value "$before" relay_invites) == absent ]] ||
+    die 'invariant drift: relay_invites unexpectedly existed in preimage'
+  [[ $(invariant_value "$after" relay_invites) == 0 ]] ||
+    die 'invariant drift: relay_invites must remain empty because minting is prohibited'
+  if ! diff -u \
+    <(grep -Ev '^(migrations|relay_invites|relay_image)=' "$before" | sort) \
+    <(grep -Ev '^(migrations|relay_invites|relay_image)=' "$after" | sort) >/dev/null; then
+    die 'invariant drift: membership, message, config, or non-relay service state changed'
+  fi
+}
+
+sql_stream_hash() {
+  local query=$1
+  docker exec "$POSTGRES_CONTAINER" psql -X -v ON_ERROR_STOP=1 \
+    -U "$DB_USER" -d "$DB_NAME" -Atc "COPY ($query) TO STDOUT" \
+    | sha256sum | cut -d' ' -f1
+}
+
+capture_invariants() {
+  require_root_for_live_action
+  local output=${1:?invariant output file required}
+  [[ ! -e "$output" ]] || die "invariant output already exists: $output"
+  local members_count members_hash messages_count messages_hash
+  local communities_count channels_count migrations relay_invites relay_image
+  local services_hash config_hash table_name
+  local -a non_relay_containers
+
+  members_count=$(psql_scalar 'select count(*) from relay_members')
+  members_hash=$(sql_stream_hash "SELECT jsonb_build_object(
+    'community_id', community_id, 'pubkey', pubkey, 'role', role,
+    'added_by', added_by, 'created_at', created_at
+    )::text FROM relay_members ORDER BY community_id, pubkey")
+  messages_count=$(psql_scalar 'select count(*) from events where kind in (9,40002,40003,40004,40005,40006,40008)')
+  messages_hash=$(sql_stream_hash "SELECT jsonb_build_object(
+    'community_id', community_id, 'id', encode(id, 'hex'),
+    'pubkey', encode(pubkey, 'hex'), 'created_at', created_at,
+    'kind', kind, 'tags', tags, 'content', content, 'sig', encode(sig, 'hex'),
+    'channel_id', channel_id, 'deleted_at', deleted_at, 'd_tag', d_tag
+    )::text FROM events WHERE kind IN (9,40002,40003,40004,40005,40006,40008)
+    ORDER BY community_id, id")
+  communities_count=$(psql_scalar 'select count(*) from communities')
+  channels_count=$(psql_scalar 'select count(*) from channels')
+  migrations=$(psql_scalar "select string_agg(version::text, ',' order by version) from _sqlx_migrations")
+  table_name=$(psql_scalar "select coalesce(to_regclass('public.relay_invites')::text, '')")
+  if [[ "$table_name" == relay_invites ]]; then
+    relay_invites=$(psql_scalar 'select count(*) from relay_invites')
+  else
+    relay_invites=absent
+  fi
+  relay_image=$(docker inspect --format='{{.Config.Image}}' "$RELAY_CONTAINER")
+  read -r -a non_relay_containers <<<"${BUZZ_NON_RELAY_CONTAINERS:-buzz-prod-postgres-1 buzz-prod-redis-1 buzz-prod-minio-1 buzz-prod-tls-1 buzz-prod-pair-1}"
+  services_hash=$(
+    docker inspect --format='{{.Id}} {{.State.StartedAt}}' \
+      "${non_relay_containers[@]}" \
+      | sha256sum | cut -d' ' -f1
+  )
+  config_hash=$(
+    for config_file in ${BUZZ_INVARIANT_CONFIG_FILES:-/etc/buzz/.env /etc/buzz/compose.yml /etc/buzz/nginx-relay.conf}; do
+      [[ -f "$config_file" ]] && sha256sum "$config_file"
+    done | sha256sum | cut -d' ' -f1
+  )
+
+  umask 077
+  {
+    printf 'members=%s:%s\n' "$members_count" "$members_hash"
+    printf 'messages=%s:%s\n' "$messages_count" "$messages_hash"
+    printf 'communities=%s\n' "$communities_count"
+    printf 'channels=%s\n' "$channels_count"
+    printf 'non_relay_services=%s\n' "$services_hash"
+    printf 'config=%s\n' "$config_hash"
+    printf 'migrations=%s\n' "$migrations"
+    printf 'relay_invites=%s\n' "$relay_invites"
+    printf 'relay_image=%s\n' "$relay_image"
+  } >"$output"
+  chmod 0600 "$output"
+}
+
+write_manifest() {
+  local directory=${1:?manifest directory required}
+  local manifest_tmp
+  [[ -d "$directory" ]] || die "manifest directory not found: $directory"
+  manifest_tmp=$(mktemp)
+  (
+    cd "$directory"
+    find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+      | sort -z | xargs -0 -r sha256sum >"$manifest_tmp"
+    install -m 0600 "$manifest_tmp" SHA256SUMS
+    sha256sum --check SHA256SUMS
+  )
+  rm -f -- "$manifest_tmp"
+}
+
+backup_preimage() {
+  require_root_for_live_action
+  local backup_dir=${1:?backup directory required}
+  [[ "$backup_dir" == /root/buzz-rollbacks/invite-v2-* ]] ||
+    die 'backup directory must be an explicit /root/buzz-rollbacks/invite-v2-* path'
+  [[ ! -e "$backup_dir" ]] || die "backup target already exists: $backup_dir"
+
+  install -d -m 0700 "$backup_dir"
+  install -m 0600 "$COMPOSE_FILE" "$backup_dir/compose.yml"
+  tar -C /etc -cf "$backup_dir/etc-buzz.tar" buzz
+  chmod 0600 "$backup_dir/etc-buzz.tar"
+  for config_file in ${BUZZ_BACKUP_CONFIG_FILES:-/etc/buzz/.env /etc/buzz/nginx-relay.conf}; do
+    if [[ -f "$config_file" ]]; then
+      install -m 0600 "$config_file" "$backup_dir/$(basename -- "$config_file")"
+    fi
+  done
+  docker inspect "$RELAY_CONTAINER" >"$backup_dir/relay-container-inspect.json"
+  chmod 0600 "$backup_dir/relay-container-inspect.json"
+  docker exec "$POSTGRES_CONTAINER" pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc \
+    >"$backup_dir/database-preimage.dump"
+  chmod 0600 "$backup_dir/database-preimage.dump"
+  write_manifest "$backup_dir"
+  umask 077
+  printf '%s\n' "$backup_dir" >"$BACKUP_POINTER"
+  printf '%s\n' "$backup_dir"
+}
+
+stage_old_guard() {
+  require_root_for_live_action
+  assert_backup_verified
+  render_overlay "$OLD_IMAGE" "$OLD_OVERLAY"
+  compose_relay_up "$OLD_OVERLAY"
+}
+
+apply_migration() {
+  require_root_for_live_action
+  assert_backup_verified
+  verify_source_migration
+  assert_auto_migrate_off "$RELAY_CONTAINER"
+
+  local existing table_name
+  existing=$(psql_scalar "SELECT success::text || ':' || encode(checksum, 'hex') FROM _sqlx_migrations WHERE version = 25")
+  if [[ -n "$existing" ]]; then
+    verify_migration_record
+    printf 'migration 25 already applied with matching SQLx checksum\n'
+    return 0
+  fi
+  table_name=$(psql_scalar "SELECT COALESCE(to_regclass('public.relay_invites')::text, '')")
+  [[ -z "$table_name" ]] || die 'relay_invites exists without a SQLx migration 25 record; refusing partial-state repair'
+
+  {
+    printf '\\set ON_ERROR_STOP on\nBEGIN;\n'
+    cat -- "$MIGRATION"
+    printf '\n'
+    printf "INSERT INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time) VALUES (25, 'relay invites', now(), TRUE, decode('%s', 'hex'), 0);\n" "$EXPECTED_MIGRATION_SHA384"
+    printf 'COMMIT;\n'
+  } | docker exec -i "$POSTGRES_CONTAINER" psql -X -v ON_ERROR_STOP=1 \
+      -U "$DB_USER" -d "$DB_NAME"
+
+  verify_migration_record
+}
+
+deploy_candidate() {
+  require_root_for_live_action
+  assert_backup_verified
+  local image=${1:?candidate image digest required}
+  assert_auto_migrate_off "$RELAY_CONTAINER"
+  verify_migration_record
+  render_overlay "$image" "$CANDIDATE_OVERLAY"
+  compose_relay_up "$CANDIDATE_OVERLAY"
+}
+
+rollback_old() {
+  require_root_for_live_action
+  render_overlay "$OLD_IMAGE" "$OLD_OVERLAY"
+  compose_relay_up "$OLD_OVERLAY"
+  verify_migration_record
+}
+
+usage() {
+  printf '%s\n' \
+    'usage:' \
+    '  invite-v2-rollout.sh render-overlay IMAGE@sha256:DIGEST OUTPUT' \
+    '  invite-v2-rollout.sh migration-checksum [MIGRATION]' \
+    '  invite-v2-rollout.sh assert-auto-migrate-off CONTAINER' \
+    '  invite-v2-rollout.sh assert-backup' \
+    '  invite-v2-rollout.sh backup /root/buzz-rollbacks/invite-v2-TIMESTAMP' \
+    '  invite-v2-rollout.sh stage-old-guard' \
+    '  invite-v2-rollout.sh apply-migration' \
+    '  invite-v2-rollout.sh deploy-candidate IMAGE@sha256:DIGEST' \
+    '  invite-v2-rollout.sh rollback' \
+    '  invite-v2-rollout.sh verify-migration' \
+    '  invite-v2-rollout.sh capture-invariants OUTPUT' \
+    '  invite-v2-rollout.sh write-manifest DIRECTORY' \
+    '  invite-v2-rollout.sh compare-invariants BEFORE AFTER'
+}
+
+command=${1:-}
+case "$command" in
+  render-overlay) render_overlay "${2:?image required}" "${3:?output required}" ;;
+  migration-checksum) migration_checksum "${2:-$MIGRATION}" ;;
+  assert-auto-migrate-off) assert_auto_migrate_off "${2:?container required}" ;;
+  assert-backup) assert_backup_verified ;;
+  backup) backup_preimage "${2:?backup directory required}" ;;
+  stage-old-guard) stage_old_guard ;;
+  apply-migration) apply_migration ;;
+  deploy-candidate) deploy_candidate "${2:?candidate image digest required}" ;;
+  rollback) rollback_old ;;
+  verify-migration) verify_migration_record ;;
+  capture-invariants) capture_invariants "${2:?output file required}" ;;
+  write-manifest) write_manifest "${2:?directory required}" ;;
+  compare-invariants) compare_invariants "${2:?before file required}" "${3:?after file required}" ;;
+  *) usage >&2; exit 64 ;;
+esac
