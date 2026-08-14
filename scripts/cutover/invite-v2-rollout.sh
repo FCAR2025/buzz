@@ -88,9 +88,11 @@ assert_backup_verified() {
     die 'verified backup required; SHA256 preimage attestation failed'
   tar -tf "$backup_dir/etc-buzz.tar" >/dev/null ||
     die 'verified backup required; etc-buzz archive is unreadable'
-  jq -e 'type == "array" and length >= 1' "$backup_dir/relay-container-inspect.json" >/dev/null ||
+  python3 -c 'import json, sys; value = json.load(open(sys.argv[1], encoding="utf-8")); sys.exit(0 if isinstance(value, list) and len(value) >= 1 else 1)' \
+    "$backup_dir/relay-container-inspect.json" >/dev/null 2>&1 ||
     die 'verified backup required; relay container inspect is unreadable'
-  pg_restore --list "$backup_dir/database-preimage.dump" >/dev/null ||
+  docker exec -i "$POSTGRES_CONTAINER" pg_restore --list - \
+    <"$backup_dir/database-preimage.dump" >/dev/null 2>&1 ||
     die 'verified backup required; PostgreSQL dump restore preflight failed'
 }
 

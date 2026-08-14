@@ -69,23 +69,38 @@ printf 'compose\n' >"$complete_backup/compose.yml"
 printf 'env\n' >"$complete_backup/.env"
 printf 'nginx\n' >"$complete_backup/nginx-relay.conf"
 printf '[{}]\n' >"$complete_backup/relay-container-inspect.json"
-printf 'dump\n' >"$complete_backup/database-preimage.dump"
+printf 'valid-dump\n' >"$complete_backup/database-preimage.dump"
 tar -cf "$complete_backup/etc-buzz.tar" -C "$tmp_dir" incomplete.pointer
 chmod 0600 "$complete_backup"/* "$complete_backup/.env"
 "$ROLLOUT" write-manifest "$complete_backup"
 printf '%s\n' "$complete_backup" >"$tmp_dir/complete.pointer"
 chmod 0600 "$tmp_dir/complete.pointer"
 
-cat >"$fake_bin/pg_restore" <<'EOF'
+cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
-if [[ "$1" == --list && -f "$2" ]]; then
-  exit 0
+if [[ "$1" == exec && "$2" == -i && "$*" == *'pg_restore --list -'* ]]; then
+  payload=$(tee)
+  [[ "$payload" == valid-dump ]]
+  exit
 fi
 exit 64
 EOF
-chmod +x "$fake_bin/pg_restore"
+chmod +x "$fake_bin/docker"
 PATH="$fake_bin:$PATH" BUZZ_ALLOW_NON_ROOT=1 BUZZ_BACKUP_PATH_PREFIX="$backup_prefix" \
   BUZZ_BACKUP_POINTER="$tmp_dir/complete.pointer" "$ROLLOUT" assert-backup
+printf 'corrupt-dump\n' >"$complete_backup/database-preimage.dump"
+chmod 0600 "$complete_backup/database-preimage.dump"
+"$ROLLOUT" write-manifest "$complete_backup"
+if PATH="$fake_bin:$PATH" BUZZ_ALLOW_NON_ROOT=1 BUZZ_BACKUP_PATH_PREFIX="$backup_prefix" \
+  BUZZ_BACKUP_POINTER="$tmp_dir/complete.pointer" "$ROLLOUT" assert-backup \
+  2>"$tmp_dir/corrupt-dump.err"; then
+  fail 'backup guard accepted a corrupt but self-consistently hashed PostgreSQL archive'
+fi
+grep -Fq 'PostgreSQL dump restore preflight failed' "$tmp_dir/corrupt-dump.err" ||
+  fail 'corrupt PostgreSQL archive failure was not explicit'
+printf 'valid-dump\n' >"$complete_backup/database-preimage.dump"
+chmod 0600 "$complete_backup/database-preimage.dump"
+"$ROLLOUT" write-manifest "$complete_backup"
 chmod 0644 "$complete_backup/.env"
 if PATH="$fake_bin:$PATH" BUZZ_ALLOW_NON_ROOT=1 BUZZ_BACKUP_PATH_PREFIX="$backup_prefix" \
   BUZZ_BACKUP_POINTER="$tmp_dir/complete.pointer" "$ROLLOUT" assert-backup \
