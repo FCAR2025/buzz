@@ -490,6 +490,11 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_RESPOND_TO_ALLOWLIST", value_delimiter = ',')]
     pub respond_to_allowlist: Option<Vec<String>>,
 
+    /// Allow explicitly listed callers to start DM turns in allowlist mode.
+    /// Default: false (only the owner and verified siblings can start DM turns).
+    #[arg(long, env = "BUZZ_ACP_ALLOW_ALLOWLISTED_DMS", default_value_t = false)]
+    pub allow_allowlisted_dms: bool,
+
     /// Comma-separated list of allowed `--respond-to` modes.
     /// When set, the harness rejects startup if `--respond-to` is not in this list.
     /// Modes: owner-only, allowlist, anyone, nobody.
@@ -598,6 +603,8 @@ pub struct Config {
     pub respond_to: RespondTo,
     /// Validated allowlist of pubkey hex strings (used when respond_to == Allowlist).
     pub respond_to_allowlist: HashSet<String>,
+    /// Opt in to DM turns from listed callers when respond_to is Allowlist.
+    pub allow_allowlisted_dms: bool,
     /// Allowed `respond_to` modes. Empty = all modes allowed.
     pub allowed_respond_to: Vec<String>,
     /// Per-persona env vars to inject at agent spawn time (e.g., GOOSE_PROVIDER, GOOSE_MODEL, BUZZ_AGENT_MODEL).
@@ -1198,6 +1205,7 @@ impl Config {
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
+            allow_allowlisted_dms: args.allow_allowlisted_dms,
             allowed_respond_to,
             persona_env_vars,
             has_generated_codex_config,
@@ -1576,6 +1584,7 @@ mod tests {
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
+            allow_allowlisted_dms: false,
             allowed_respond_to: Vec::new(),
             persona_env_vars: vec![],
             has_generated_codex_config: false,
@@ -2610,6 +2619,28 @@ channels = "ALL"
             RespondTo::from_str("nobody", true).unwrap(),
             RespondTo::Nobody
         );
+    }
+
+    #[test]
+    fn test_allow_allowlisted_dms_flag_parses() {
+        let parsed = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            &"01".repeat(32),
+            "--respond-to",
+            "allowlist",
+            "--respond-to-allowlist",
+            &"02".repeat(32),
+            "--allow-allowlisted-dms",
+        ]);
+        let args = parsed.expect("explicit staff DM opt-in must parse");
+        assert!(Config::from_args(args).unwrap().allow_allowlisted_dms);
+    }
+
+    #[test]
+    fn test_allow_allowlisted_dms_defaults_to_false() {
+        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &"01".repeat(32)]);
+        assert!(!Config::from_args(args).unwrap().allow_allowlisted_dms);
     }
 
     #[test]

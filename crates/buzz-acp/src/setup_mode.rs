@@ -355,8 +355,13 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     tracing::info!("setup-mode: connected and subscribed to membership notifications");
 
     let rest_client = relay.rest_client();
-    let mut author_gate_ctx =
-        crate::InboundAuthorGate::connect(&rest_client, &pubkey_hex, "setup startup").await;
+    let mut author_gate_ctx = crate::InboundAuthorGate::connect(
+        &rest_client,
+        &pubkey_hex,
+        "setup startup",
+        config.allow_allowlisted_dms,
+    )
+    .await;
 
     // Resolve owner for author-gate (same priority as normal mode).
     let startup_owner = crate::resolve_agent_owner(&config);
@@ -430,7 +435,8 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
 
         // Apply the same author gate as normal mode so the nudge only goes
         // to authors the real agent would have answered. Same DM hardening:
-        // in DMs only owner/siblings get a nudge (fail-closed on unknown type).
+        // in DMs only owner/siblings get a nudge unless listed DM callers were
+        // explicitly enabled (unknown channel types use the same DM gate).
         let Some(authorized_event) = authorize_setup_listener_event(
             &mut author_gate_ctx,
             buzz_event,
@@ -820,7 +826,8 @@ mod tests {
         let relay_hex = relay_keys.public_key().to_hex();
         let (rest_client, server) =
             crate::author_gate_tests::nip11_server(serde_json::json!({ "self": relay_hex })).await;
-        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "setup nudge test").await;
+        let mut gate =
+            InboundAuthorGate::connect(&rest_client, &agent, "setup nudge test", false).await;
         let owner_cache = OwnerCache::new(Some(workflow_owner.clone()));
         let channel_info = crate::pool::ChannelInfoResolver::new(
             std::collections::HashMap::from([(
@@ -926,7 +933,8 @@ mod tests {
             crate::author_gate_tests::nip11_server(serde_json::json!({})).await;
         let (query_rest, query_server) =
             crate::author_gate_tests::nip11_server(original_response).await;
-        let mut gate = InboundAuthorGate::connect(&gate_rest, &agent, "setup edit test").await;
+        let mut gate =
+            InboundAuthorGate::connect(&gate_rest, &agent, "setup edit test", false).await;
         let channel_info = crate::pool::ChannelInfoResolver::new(
             std::collections::HashMap::from([(
                 channel_id,
