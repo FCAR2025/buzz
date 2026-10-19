@@ -571,12 +571,14 @@ mod inbound_author_gate {
         allowlist: &HashSet<String>,
         author: &str,
         is_dm: bool,
+        allow_allowlisted_dms: bool,
         owner_cache: &OwnerCache,
         rest_client: &relay::RestClient,
     ) -> bool {
         if is_dm {
             return match respond_to {
                 RespondTo::Nobody => false,
+                RespondTo::Allowlist if allow_allowlisted_dms && allowlist.contains(author) => true,
                 _ => is_owner_or_sibling(author, owner_cache, rest_client).await,
             };
         }
@@ -605,6 +607,7 @@ mod inbound_author_gate {
             allowlist,
             author,
             is_dm,
+            false,
             owner_cache,
             rest_client,
         )
@@ -613,6 +616,7 @@ mod inbound_author_gate {
 
     pub(crate) struct InboundAuthorGate {
         agent_pubkey_hex: String,
+        allow_allowlisted_dms: bool,
         relay_self: Option<String>,
         // None means no authoritative NIP-11 result yet, including at startup.
         refreshed_generation: Option<u64>,
@@ -628,10 +632,12 @@ mod inbound_author_gate {
             rest_client: &relay::RestClient,
             agent_pubkey_hex: &str,
             context: &str,
+            allow_allowlisted_dms: bool,
         ) -> Self {
             let (relay_self, completed) = refresh_relay_self(rest_client, None, context).await;
             Self {
                 agent_pubkey_hex: agent_pubkey_hex.to_string(),
+                allow_allowlisted_dms,
                 relay_self,
                 refreshed_generation: completed.then_some(0),
             }
@@ -707,6 +713,7 @@ mod inbound_author_gate {
                 allowlist,
                 &effective_author,
                 is_dm,
+                self.allow_allowlisted_dms,
                 owner_cache,
                 rest_client,
             )
@@ -2920,8 +2927,13 @@ async fn run_harness(
     tracing::info!("connected to relay at {}", config.relay_url);
 
     let relay_rest_client = relay.rest_client();
-    let mut author_gate_ctx =
-        InboundAuthorGate::connect(&relay_rest_client, &pubkey_hex, "startup").await;
+    let mut author_gate_ctx = InboundAuthorGate::connect(
+        &relay_rest_client,
+        &pubkey_hex,
+        "startup",
+        config.allow_allowlisted_dms,
+    )
+    .await;
 
     relay
         .subscribe_membership_notifications()
@@ -7434,7 +7446,7 @@ mod author_gate_tests {
         tokio::task::JoinHandle<()>,
     ) {
         let (rest_client, server) = nip11_server(serde_json::json!({ "self": relay_hex })).await;
-        let gate = InboundAuthorGate::connect(&rest_client, agent, "test").await;
+        let gate = InboundAuthorGate::connect(&rest_client, agent, "test", false).await;
         (gate, rest_client, server)
     }
 
@@ -7487,7 +7499,8 @@ mod author_gate_tests {
         let relay_hex = relay_keys.public_key().to_hex();
         let agent = nostr::Keys::generate().public_key().to_hex();
         let (rest_client, server) = nip11_scripted_server(responses).await;
-        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "listener startup").await;
+        let mut gate =
+            InboundAuthorGate::connect(&rest_client, &agent, "listener startup", false).await;
         let configured_owner = if cache_owner {
             Some(workflow_owner.to_string())
         } else if cache_sibling {
@@ -7803,7 +7816,7 @@ mod author_gate_tests {
         let agent = nostr::Keys::generate().public_key().to_hex();
         let (rest_client, server) = nip11_server(serde_json::json!({ "self": relay_hex })).await;
 
-        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test").await;
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test", false).await;
         assert!(
             gate.has_relay_identity(),
             "the gate must load the relay signing identity during construction"
@@ -7865,7 +7878,7 @@ mod author_gate_tests {
         // A NIP-11 document with no `self` key: attribution is unavailable.
         let (rest_client, server) = nip11_server(serde_json::json!({ "name": "relay" })).await;
 
-        let gate = InboundAuthorGate::connect(&rest_client, &agent, "test").await;
+        let gate = InboundAuthorGate::connect(&rest_client, &agent, "test", false).await;
         assert!(
             !gate.has_relay_identity(),
             "a NIP-11 document without `self` must leave attribution unavailable"
@@ -7914,7 +7927,7 @@ mod author_gate_tests {
             keys: nostr::Keys::generate(),
             auth_tag_json: None,
         };
-        let mut gate = InboundAuthorGate::connect(&unreachable, &agent, "test").await;
+        let mut gate = InboundAuthorGate::connect(&unreachable, &agent, "test", false).await;
         assert!(!gate.has_relay_identity());
 
         let (rest_client, server) = nip11_server(serde_json::json!({ "self": relay_hex })).await;
@@ -7984,7 +7997,7 @@ mod author_gate_tests {
             Ok(serde_json::json!({ "self": relay_hex.clone() })),
         ]))
         .await;
-        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "startup").await;
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "startup", false).await;
         assert!(!gate.has_relay_identity());
         let channel_id = Uuid::new_v4();
         let owner_cache = OwnerCache::new(Some(workflow_owner.clone()));
@@ -8046,7 +8059,7 @@ mod author_gate_tests {
             }
             responses.push_back(Ok(serde_json::json!({ "self": next_relay_hex.clone() })));
             let (rest_client, server) = nip11_scripted_server(responses).await;
-            let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "startup").await;
+            let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "startup", false).await;
             assert_eq!(gate.relay_identity_for_test(), identity.as_deref());
             let channel_id = Uuid::new_v4();
             let channel_info = pool::ChannelInfoResolver::new(
@@ -8122,7 +8135,7 @@ mod author_gate_tests {
             Ok(serde_json::json!({ "self": new_relay_hex.clone() })),
         ]))
         .await;
-        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test").await;
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test", false).await;
         let owner_cache = OwnerCache::new(Some(workflow_owner.clone()));
         owner_cache.cache_sibling(old_relay_hex.clone(), false);
         owner_cache.cache_sibling(new_relay_hex.clone(), false);
@@ -8435,8 +8448,63 @@ mod author_gate_tests {
     //
     // In a DM, clients auto-p-tag every participant, and an agent can be
     // asked to open a DM with a third party. The gate must therefore ignore
-    // the allowlist and `anyone` mode inside DMs: only owner + verified
-    // siblings fire turns.
+    // `anyone` mode inside DMs. By default only owner + verified siblings
+    // fire turns; explicit DM opt-in also admits listed callers in allowlist mode.
+
+    #[tokio::test]
+    async fn test_dm_opt_in_author_policy_matrix() {
+        let keys = [
+            nostr::Keys::generate(),
+            nostr::Keys::generate(),
+            nostr::Keys::generate(),
+            nostr::Keys::generate(),
+        ];
+        let authors = keys.each_ref().map(|key| key.public_key().to_hex());
+        let cache = OwnerCache::new(Some(authors[0].clone()));
+        for (index, author) in authors.iter().enumerate().skip(1) {
+            cache.cache_sibling(author.clone(), index == 1);
+        }
+        let allowlist = HashSet::from([authors[2].clone()]);
+        let relay_keys = nostr::Keys::generate();
+        let (rest, server) = nip11_server(serde_json::json!({
+            "self": relay_keys.public_key().to_hex()
+        }))
+        .await;
+        for opt_in in [false, true] {
+            let gate = InboundAuthorGate::connect(&rest, "agent", "DM opt-in test", opt_in).await;
+            for mode in [
+                RespondTo::OwnerOnly,
+                RespondTo::Allowlist,
+                RespondTo::Anyone,
+                RespondTo::Nobody,
+            ] {
+                for (index, key) in keys.iter().enumerate() {
+                    let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "hello")
+                        .sign_with_keys(key)
+                        .unwrap();
+                    for is_dm in [false, true] {
+                        let expected = match (&mode, index, is_dm, opt_in) {
+                            (RespondTo::Nobody, _, _, _) => false,
+                            (_, 0 | 1, _, _) => true,
+                            (RespondTo::Allowlist, 2, true, true) => true,
+                            (_, _, true, _) => false,
+                            (RespondTo::Anyone, _, false, _) => true,
+                            (RespondTo::Allowlist, 2, false, _) => true,
+                            _ => false,
+                        };
+                        let decision = gate
+                            .evaluate_for_test(&event, &mode, &allowlist, is_dm, &cache, &rest)
+                            .await;
+                        assert_eq!(
+                            decision.allowed, expected,
+                            "opt_in={opt_in} mode={mode} author={index} is_dm={is_dm}"
+                        );
+                    }
+                }
+            }
+        }
+        server.abort();
+    }
 
     #[tokio::test]
     async fn test_dm_rejects_allowlisted_external_pubkey() {
@@ -10126,6 +10194,7 @@ mod build_mcp_servers_tests {
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
+            allow_allowlisted_dms: false,
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
             has_generated_codex_config: false,
@@ -11223,6 +11292,7 @@ mod error_outcome_emission_tests {
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
+            allow_allowlisted_dms: false,
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
             has_generated_codex_config: false,
